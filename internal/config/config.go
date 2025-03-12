@@ -36,6 +36,19 @@ type JWTConfig struct {
 type StorageConfig struct {
 	Path          string
 	MaxUploadSize int64
+	Provider      string
+	SeaweedFS     SeaweedFSConfig
+}
+
+type SeaweedFSConfig struct {
+	MasterURL  string
+	Container  string
+	Volume     string
+	MasterPort int
+	VolumePort int
+	DataDir    string
+	VolumeMax  int
+	Replicas   int
 }
 
 func Load() (*Config, error) {
@@ -63,6 +76,17 @@ func Load() (*Config, error) {
 		Storage: StorageConfig{
 			Path:          getEnv("STORAGE_PATH", "./storage/media"),
 			MaxUploadSize: int64(getEnvAsInt("MAX_UPLOAD_SIZE", 10485760)),
+			Provider:      getEnv("STORAGE_PROVIDER", "local"),
+			SeaweedFS: SeaweedFSConfig{
+				MasterURL:  getEnv("SEAWEEDFS_MASTER_URL", "http://localhost:9333"),
+				Container:  getEnv("SEAWEED_CONTAINER", "media-center-seaweedfs"),
+				Volume:     getEnv("SEAWEED_VOLUME", "media-center-seaweedfs-data"),
+				MasterPort: getEnvAsInt("SEAWEED_MASTER_PORT", 9333),
+				VolumePort: getEnvAsInt("SEAWEED_VOLUME_PORT", 8080),
+				DataDir:    getEnv("SEAWEED_DATA_DIR", "/data"),
+				VolumeMax:  getEnvAsInt("SEAWEED_VOLUME_MAX", 30000),
+				Replicas:   getEnvAsInt("SEAWEED_REPLICAS", 1),
+			},
 		},
 	}
 

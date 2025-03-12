@@ -3,19 +3,93 @@ package handlers
 import (
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"time"
 
 	"go-media-center-example/internal/config"
 	"go-media-center-example/internal/database"
 	"go-media-center-example/internal/models"
+	"go-media-center-example/internal/storage"
 	"go-media-center-example/internal/utils"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
+
+// initializeStorage creates a new storage provider based on configuration
+func initializeStorage() (storage.Storage, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %v", err)
+	}
+
+	var provider storage.StorageProvider
+	switch cfg.Storage.Provider {
+	case "seaweedfs":
+		provider = storage.SeaweedFS
+	case "s3":
+		provider = storage.S3
+	default:
+		return nil, fmt.Errorf("unsupported storage provider: %s", cfg.Storage.Provider)
+	}
+
+	// Configure storage with both internal and public URLs
+	storageConfig := map[string]string{
+		"master_url":   cfg.Storage.SeaweedFS.MasterURL,
+		"internal_url": fmt.Sprintf("http://localhost:%d", cfg.Storage.SeaweedFS.VolumePort),
+		"public_url":   fmt.Sprintf("http://localhost:%s", cfg.Server.Port),
+	}
+
+	return storage.NewStorage(provider, storageConfig)
+}
+
+// ServeMediaFile handles serving media files through the application server
+func ServeMediaFile(c *gin.Context) {
+	filename := c.Param("filename")
+	userID, _ := c.Get("user_id")
+
+	// Find media by filename
+	var media models.Media
+	if err := database.GetDB().Where("url LIKE ?", "%"+filename+"%").
+		Where("user_id = ?", userID).
+		First(&media).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Media not found"})
+		return
+	}
+
+	// Initialize storage
+	storageProvider, err := initializeStorage()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to initialize storage: %v", err)})
+		return
+	}
+
+	// Get internal URL for the file
+	internalURL := storageProvider.GetInternalURL(media.URL)
+
+	// Create HTTP client
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	// Fetch file from storage
+	resp, err := client.Get(internalURL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to fetch file: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	// Set content type from metadata if available
+	if contentType, ok := media.Metadata["mime_type"].(string); ok {
+		c.Header("Content-Type", contentType)
+	}
+
+	// Set filename for download
+	if originalName, ok := media.Metadata["original_name"].(string); ok {
+		c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", originalName))
+	}
+
+	// Stream the file to the response
+	c.DataFromReader(http.StatusOK, resp.ContentLength, resp.Header.Get("Content-Type"), resp.Body, nil)
+}
 
 func UploadMedia(c *gin.Context) {
 	cfg, _ := config.Load()
@@ -32,38 +106,22 @@ func UploadMedia(c *gin.Context) {
 		return
 	}
 
-	// Generate unique filename
-	filename := uuid.New().String() + filepath.Ext(file.Filename)
-
-	// Read file
-	f, err := file.Open()
+	// Initialize storage
+	storageProvider, err := initializeStorage()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read file"})
-		return
-	}
-	defer f.Close()
-
-	fileBytes := make([]byte, file.Size)
-	if _, err := f.Read(fileBytes); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read file"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to initialize storage: %v", err)})
 		return
 	}
 
-	// Save file
-	filePath, err := utils.SaveFile(fileBytes, filename, cfg.Storage.Path)
+	// Upload file to storage
+	fileID, err := storageProvider.Upload(file)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to upload file: %v", err)})
 		return
 	}
 
-	// Process image if applicable
-	fileType := utils.GetFileType(filename)
-	if fileType == "image" {
-		if err := utils.ProcessImage(filePath); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process image"})
-			return
-		}
-	}
+	// Get the public URL for the file
+	fileURL := storageProvider.GetURL(fileID)
 
 	// Get folder ID if provided
 	folderID := c.PostForm("folder_id")
@@ -95,20 +153,23 @@ func UploadMedia(c *gin.Context) {
 			tags = append(tags, tag)
 		}
 	}
+	fileInternalURL := storageProvider.GetInternalURL(fileID)
 
 	// Create metadata with additional info
 	metadata := models.JSON{
 		"original_name": file.Filename,
 		"mime_type":     file.Header.Get("Content-Type"),
 		"uploaded_at":   time.Now().Format(time.RFC3339),
+		"file_id":       fileID,
+		"file_url":      fileInternalURL,
 	}
 
 	// Save to database
 	media := models.Media{
 		Name:     file.Filename,
-		Type:     fileType,
+		Type:     utils.GetFileType(file.Filename),
 		Size:     file.Size,
-		URL:      "/storage/" + filename,
+		URL:      fileURL,
 		UserID:   userID.(uint),
 		FolderID: fID,
 		Metadata: metadata,
@@ -120,16 +181,28 @@ func UploadMedia(c *gin.Context) {
 	if err := tx.Create(&media).Error; err != nil {
 		tx.Rollback()
 		// Clean up uploaded file
-		os.Remove(filePath)
+		storageProvider.Delete(fileID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to save media metadata: %v", err)})
 		return
 	}
 	tx.Commit()
 
+	// // Add the public URL to the response
+	// media.Metadata["file_url"] = fileInternalURL
+
 	c.JSON(http.StatusOK, gin.H{
 		"message": "File uploaded successfully",
 		"media":   media,
 	})
+}
+
+// Add a helper method to get file URL
+func getFileURL(mediaItem *models.Media) (string, error) {
+	storageProvider, err := initializeStorage()
+	if err != nil {
+		return "", err
+	}
+	return storageProvider.GetURL(mediaItem.URL), nil
 }
 
 func ListMedia(c *gin.Context) {
@@ -195,6 +268,16 @@ func ListMedia(c *gin.Context) {
 		return
 	}
 
+	// Add file URLs to the response
+	for i := range media {
+		if fileURL, err := getFileURL(&media[i]); err == nil {
+			if media[i].Metadata == nil {
+				media[i].Metadata = models.JSON{}
+			}
+			media[i].Metadata["file_url"] = fileURL
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"media": media,
 		"pagination": gin.H{
@@ -217,6 +300,14 @@ func GetMedia(c *gin.Context) {
 		First(&media).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Media not found: %v", err)})
 		return
+	}
+
+	// Add file URL to the response
+	if fileURL, err := getFileURL(&media); err == nil {
+		if media.Metadata == nil {
+			media.Metadata = models.JSON{}
+		}
+		media.Metadata["file_url"] = fileURL
 	}
 
 	// Get folder info if media is in a folder
@@ -283,11 +374,16 @@ func DeleteMedia(c *gin.Context) {
 		return
 	}
 
-	// Delete file
-	cfg, _ := config.Load()
-	filePath := filepath.Join(cfg.Storage.Path, filepath.Base(media.URL))
-	if err := os.Remove(filePath); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete file"})
+	// Initialize storage
+	storageProvider, err := initializeStorage()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to initialize storage: %v", err)})
+		return
+	}
+
+	// Delete file from storage
+	if err := storageProvider.Delete(media.URL); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to delete file: %v", err)})
 		return
 	}
 

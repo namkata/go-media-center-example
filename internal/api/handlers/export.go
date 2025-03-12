@@ -27,11 +27,14 @@ func ExportCSV(c *gin.Context) {
 
 	writer := csv.NewWriter(c.Writer)
 	// Write header
-	writer.Write([]string{"ID", "Name", "Type", "Size", "URL", "Created At", "Updated At"})
+	if err := writer.Write([]string{"ID", "Name", "Type", "Size", "URL", "Created At", "Updated At"}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write CSV header"})
+		return
+	}
 
 	// Write data
 	for _, m := range media {
-		writer.Write([]string{
+		if err := writer.Write([]string{
 			fmt.Sprint(m.ID),
 			m.Name,
 			m.Type,
@@ -39,7 +42,10 @@ func ExportCSV(c *gin.Context) {
 			m.URL,
 			m.CreatedAt.String(),
 			m.UpdatedAt.String(),
-		})
+		}); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write CSV data"})
+			return
+		}
 	}
 
 	writer.Flush()
@@ -59,9 +65,9 @@ func ExportJSON(c *gin.Context) {
 
 	jsonData, err := json.MarshalIndent(media, "", "  ")
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate JSON"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal JSON"})
 		return
 	}
 
-	c.Writer.Write(jsonData)
+	c.Data(http.StatusOK, "application/json", jsonData)
 }
