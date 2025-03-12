@@ -6,7 +6,7 @@ endif
 
 Now, let's create a Makefile:
 
-.PHONY: run build test migrate lint clean seaweed-start seaweed-stop seaweed-status
+.PHONY: localstack-start localstack-stop localstack-create-bucket localstack-list-buckets localstack-status dev-setup run build test migrate lint clean seaweed-start seaweed-stop seaweed-status
 
 # Application
 APP_NAME=media-center
@@ -32,6 +32,52 @@ SEAWEED_DATA_DIR?=/data
 SEAWEED_REPLICAS?=1
 
 all: build
+# LocalStack management
+localstack-start:
+	@echo "Starting LocalStack container..."
+	@docker run -d \
+		--name $(LOCALSTACK_CONTAINER) \
+		-p $(LOCALSTACK_PORT):4566 \
+		-p 4510-4559:4510-4559 \
+		-e SERVICES=s3 \
+		-e DEFAULT_REGION=$(AWS_REGION) \
+		-e AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY_ID) \
+		-e AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY) \
+		localstack/localstack:$(LOCALSTACK_VERSION)
+	@echo "Waiting for LocalStack to be ready..."
+	@sleep 10
+	@make localstack-create-bucket
+
+localstack-stop:
+	@echo "Stopping LocalStack container..."
+	@docker stop $(LOCALSTACK_CONTAINER) || true
+	@docker rm $(LOCALSTACK_CONTAINER) || true
+
+localstack-create-bucket:
+	@echo "Creating S3 bucket..."
+	@aws --endpoint-url=http://localhost:$(LOCALSTACK_PORT) \
+		s3 mb s3://$(AWS_BUCKET_NAME) \
+		--region $(AWS_REGION) || true
+	@aws --endpoint-url=http://localhost:$(LOCALSTACK_PORT) \
+		s3api put-bucket-acl \
+		--bucket $(AWS_BUCKET_NAME) \
+		--acl public-read || true
+
+localstack-list-buckets:
+	@aws --endpoint-url=http://localhost:$(LOCALSTACK_PORT) \
+		s3 ls
+
+localstack-status:
+	@echo "Checking LocalStack container status..."
+	@docker ps -f name=$(LOCALSTACK_CONTAINER) --format "{{.Status}}" || echo "Container not running"
+
+# Development setup
+dev-setup: localstack-start
+	@echo "Development environment setup complete"
+
+# Clean up
+clean: localstack-stop
+	@echo "Clean up complete"
 
 # SeaweedFS commands
 seaweed-start:

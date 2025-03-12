@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/linxGnu/goseaweedfs"
@@ -87,16 +89,49 @@ func NewSeaweedFSStorage(config map[string]string) (*SeaweedFSStorage, error) {
 
 // NewS3Storage creates a new S3 storage instance
 func NewS3Storage(config map[string]string) (*S3Storage, error) {
-	awsCfg, err := awsconfig.LoadDefaultConfig(context.TODO(),
-		awsconfig.WithRegion(config["region"]),
-	)
+	var options []func(*awsconfig.LoadOptions) error
+
+	// Add region
+	options = append(options, awsconfig.WithRegion(config["region"]))
+
+	// Add credentials if provided
+	if config["access_key_id"] != "" && config["secret_access_key"] != "" {
+		options = append(options, awsconfig.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(
+				config["access_key_id"],
+				config["secret_access_key"],
+				"",
+			),
+		))
+	}
+
+	// Add custom endpoint if provided
+	if config["endpoint"] != "" {
+		customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:               config["endpoint"],
+				SigningRegion:     config["region"],
+				HostnameImmutable: true,
+			}, nil
+		})
+		options = append(options, awsconfig.WithEndpointResolverWithOptions(customResolver))
+	}
+
+	// Load AWS configuration
+	awsCfg, err := awsconfig.LoadDefaultConfig(context.TODO(), options...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %v", err)
 	}
 
-	client := s3.NewFromConfig(awsCfg)
+	// Create S3 client with options
+	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		if config["force_path_style"] == "true" {
+			o.UsePathStyle = true
+		}
+	})
+
 	return &S3Storage{
-		client:    client,
+		client:    s3Client,
 		bucket:    config["bucket"],
 		region:    config["region"],
 		publicURL: config["public_url"],

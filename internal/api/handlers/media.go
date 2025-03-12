@@ -33,11 +33,26 @@ func initializeStorage() (storage.Storage, error) {
 		return nil, fmt.Errorf("unsupported storage provider: %s", cfg.Storage.Provider)
 	}
 
-	// Configure storage with both internal and public URLs
-	storageConfig := map[string]string{
-		"master_url":   cfg.Storage.SeaweedFS.MasterURL,
-		"internal_url": fmt.Sprintf("http://localhost:%d", cfg.Storage.SeaweedFS.VolumePort),
-		"public_url":   fmt.Sprintf("http://localhost:%s", cfg.Server.Port),
+	// Configure storage based on provider
+	storageConfig := make(map[string]string)
+
+	switch provider {
+	case storage.SeaweedFS:
+		storageConfig = map[string]string{
+			"master_url":   cfg.Storage.SeaweedFS.MasterURL,
+			"internal_url": fmt.Sprintf("http://localhost:%d", cfg.Storage.SeaweedFS.VolumePort),
+			"public_url":   fmt.Sprintf("http://localhost:%s", cfg.Server.Port),
+		}
+	case storage.S3:
+		storageConfig = map[string]string{
+			"region":            cfg.Storage.S3.Region,
+			"access_key_id":     cfg.Storage.S3.AccessKeyID,
+			"secret_access_key": cfg.Storage.S3.SecretAccessKey,
+			"bucket":            cfg.Storage.S3.BucketName,
+			"public_url":        cfg.Storage.S3.PublicURL,
+			"endpoint":          cfg.Storage.S3.Endpoint,
+			"force_path_style":  fmt.Sprintf("%v", cfg.Storage.S3.ForcePathStyle),
+		}
 	}
 
 	return storage.NewStorage(provider, storageConfig)

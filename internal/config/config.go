@@ -38,6 +38,7 @@ type StorageConfig struct {
 	MaxUploadSize int64
 	Provider      string
 	SeaweedFS     SeaweedFSConfig
+	S3            S3Config
 }
 
 type SeaweedFSConfig struct {
@@ -49,6 +50,16 @@ type SeaweedFSConfig struct {
 	DataDir    string
 	VolumeMax  int
 	Replicas   int
+}
+
+type S3Config struct {
+	Region          string
+	AccessKeyID     string
+	SecretAccessKey string
+	BucketName      string
+	PublicURL       string
+	Endpoint        string
+	ForcePathStyle  bool
 }
 
 func Load() (*Config, error) {
@@ -87,6 +98,15 @@ func Load() (*Config, error) {
 				VolumeMax:  getEnvAsInt("SEAWEED_VOLUME_MAX", 30000),
 				Replicas:   getEnvAsInt("SEAWEED_REPLICAS", 1),
 			},
+			S3: S3Config{
+				Region:          getEnv("AWS_REGION", "us-east-1"),
+				AccessKeyID:     getEnv("AWS_ACCESS_KEY_ID", ""),
+				SecretAccessKey: getEnv("AWS_SECRET_ACCESS_KEY", ""),
+				BucketName:      getEnv("AWS_BUCKET_NAME", ""),
+				PublicURL:       getEnv("AWS_PUBLIC_URL", ""),
+				Endpoint:        getEnv("AWS_ENDPOINT", ""),
+				ForcePathStyle:  getEnvAsBool("AWS_FORCE_PATH_STYLE", false),
+			},
 		},
 	}
 
@@ -111,6 +131,13 @@ func getEnvAsInt(key string, defaultValue int) int {
 		if _, err := fmt.Sscanf(value, "%d", &intVal); err == nil {
 			return intVal
 		}
+	}
+	return defaultValue
+}
+
+func getEnvAsBool(key string, defaultValue bool) bool {
+	if value, exists := os.LookupEnv(key); exists {
+		return value == "true" || value == "1" || value == "yes"
 	}
 	return defaultValue
 }

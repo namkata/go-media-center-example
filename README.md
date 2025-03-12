@@ -1,136 +1,181 @@
-Here's an updated version of the README.md with more comprehensive information:
+# Media Center Example
 
-```markdown:/Users/trannam/Products/go-media-center-example/README.md
-# Go Media Center
-
-A media management system built with Go, Gin, and PostgreSQL.
+A Go-based media center application that demonstrates file storage handling using both SeaweedFS and AWS S3 (with LocalStack support for development).
 
 ## Features
 
-- User authentication with JWT
 - File upload and management
+- Support for multiple storage backends:
+  - SeaweedFS (distributed file system)
+  - AWS S3 (with LocalStack support for local development)
+- Image processing capabilities
+- Video metadata extraction
 - Folder organization
-- Media tagging and searching
-- Image processing and optimization
+- Tag management
+- User authentication
 - RESTful API
-- Pagination and filtering
-- Export functionality (CSV, JSON)
 
 ## Prerequisites
 
-- Go 1.23 or higher
-- PostgreSQL 14 or higher
-- Make (optional, for using Makefile commands)
+- Go 1.23 or later
+- Docker and Docker Compose
+- PostgreSQL
+- FFmpeg (for video processing)
+- AWS CLI (for LocalStack interaction)
 
-## Setup
+## Quick Start
 
 1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/go-media-center-example.git
-cd go-media-center-example
-```
+   ```bash
+   git clone https://github.com/yourusername/go-media-center-example
+   cd go-media-center-example
+   ```
 
-2. Create environment file:
-```bash
-make .env
-```
+2. Copy the example environment file:
+   ```bash
+   cp .env.example .env
+   ```
 
-3. Update the `.env` file with your configuration:
-```plaintext
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=media_center
-DB_USER=postgres
-DB_PASSWORD=your_password
+3. Start the development environment:
+   ```bash
+   make dev-setup
+   ```
 
-JWT_SECRET=your_secret_key
-STORAGE_PATH=./storage
-MAX_UPLOAD_SIZE=10485760
-```
+4. Run the application:
+   ```bash
+   make run
+   ```
 
-4. Install dependencies:
-```bash
-make deps
-```
+## Storage Configuration
 
-5. Run migrations:
-```bash
-make migrate
-```
+### LocalStack S3 (Development)
 
-6. Build and run:
-```bash
-make build
-make run
+The project uses LocalStack to simulate AWS S3 locally during development.
+
+1. Start LocalStack and create the test bucket:
+   ```bash
+   make localstack-start
+   ```
+
+2. Verify the setup:
+   ```bash
+   make localstack-status
+   make localstack-list-buckets
+   ```
+
+3. Run the S3 test script:
+   ```bash
+   go run scripts/test_s3.go
+   ```
+
+### SeaweedFS
+
+Alternatively, you can use SeaweedFS as your storage backend:
+
+1. Start SeaweedFS:
+   ```bash
+   make seaweed-start
+   ```
+
+2. Check the status:
+   ```bash
+   make seaweed-status
+   ```
+
+3. View logs:
+   ```bash
+   make seaweed-logs
+   ```
+
+## Environment Variables
+
+Key configuration options in `.env`:
+
+```env
+# Storage Configuration
+STORAGE_PROVIDER=s3  # Options: seaweedfs, s3
+MAX_UPLOAD_SIZE=104857600  # 100MB in bytes
+
+# AWS S3/LocalStack Configuration
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=test
+AWS_SECRET_ACCESS_KEY=test
+AWS_BUCKET_NAME=media-center-bucket
+AWS_PUBLIC_URL=http://localhost:4566
+AWS_ENDPOINT=http://localhost:4566
+AWS_FORCE_PATH_STYLE=true
+
+# SeaweedFS Configuration
+SEAWEED_CONTAINER=media-center-seaweedfs
+SEAWEED_VOLUME=media-center-seaweedfs-data
+SEAWEED_MASTER_PORT=9333
+SEAWEED_VOLUME_PORT=8080
 ```
 
 ## API Endpoints
 
 ### Authentication
-- POST `/api/auth/register` - Register new user
-- POST `/api/auth/login` - Login user
+- `POST /api/v1/auth/register` - Register a new user
+- `POST /api/v1/auth/login` - Login and get JWT token
 
-### Media
-- POST `/api/media` - Upload media
-- GET `/api/media` - List media
-- GET `/api/media/:id` - Get media details
-- PUT `/api/media/:id` - Update media
-- DELETE `/api/media/:id` - Delete media
-- POST `/api/media/batch` - Batch operations
+### Media Management
+- `POST /api/v1/media/upload` - Upload media file
+- `GET /api/v1/media/list` - List all media files
+- `GET /api/v1/media/:id` - Get media details
+- `PUT /api/v1/media/:id` - Update media metadata
+- `DELETE /api/v1/media/:id` - Delete media file
 
 ### Folders
-- POST `/api/folders` - Create folder
-- GET `/api/folders` - List folders
-- PUT `/api/folders/:id` - Update folder
-- DELETE `/api/folders/:id` - Delete folder
+- `POST /api/v1/folders` - Create folder
+- `GET /api/v1/folders` - List folders
+- `PUT /api/v1/folders/:id` - Update folder
+- `DELETE /api/v1/folders/:id` - Delete folder
 
-### Export
-- GET `/api/export/csv` - Export media list as CSV
-- GET `/api/export/json` - Export media list as JSON
+## Development Commands
 
-## Development
+```bash
+# Build the application
+make build
 
-### Available Make Commands
-- `make run` - Run the application
-- `make build` - Build the application
-- `make test` - Run tests
-- `make migrate` - Run database migrations
-- `make migrate-create` - Create new migration
-- `make lint` - Run linter
-- `make clean` - Clean build artifacts
-- `make deps` - Install dependencies
+# Run tests
+make test
 
-### Project Structure
-```
-.
-├── cmd/
-│   └── api/
-│       └── main.go
-├── internal/
-│   ├── api/
-│   ├── config/
-│   ├── database/
-│   ├── models/
-│   └── utils/
-├── database/
-│   └── migrations/
-├── storage/
-├── .env
-├── .env.example
-├── go.mod
-├── go.sum
-└── Makefile
+# Run linter
+make lint
+
+# Create a new migration
+make migrate-create
+
+# Apply migrations
+make migrate
+
+# Clean up
+make clean
 ```
 
-## License
+## File Upload Specifications
 
-MIT License
+- Maximum file size: 100MB (configurable)
+- Supported image formats: JPG, PNG, GIF
+- Supported video formats: MP4, MOV, AVI
+- Automatic metadata extraction for both images and videos
+- Image processing capabilities (resize, crop)
+- Multipart upload support for large files
 
 ## Contributing
 
 1. Fork the repository
-2. Create your feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a new Pull Request
-```
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- [SeaweedFS](https://github.com/chrislusf/seaweedfs) for distributed file system
+- [LocalStack](https://localstack.cloud/) for AWS service emulation
+- [FFmpeg](https://ffmpeg.org/) for video processing
