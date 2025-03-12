@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"go-media-center-example/internal/config"
@@ -47,6 +48,11 @@ func ServeMediaFile(c *gin.Context) {
 	filename := c.Param("filename")
 	userID, _ := c.Get("user_id")
 
+	// Parse width and height parameters
+	width := c.Query("w")
+	height := c.Query("h")
+	fit := c.DefaultQuery("fit", "contain") // contain, cover, fill
+
 	// Find media by filename
 	var media models.Media
 	if err := database.GetDB().Where("url LIKE ?", "%"+filename+"%").
@@ -63,13 +69,13 @@ func ServeMediaFile(c *gin.Context) {
 		return
 	}
 
-	// Get internal URL for the file
+	// Get internal URL for the file using the stored file ID
 	internalURL := storageProvider.GetInternalURL(media.URL)
 
-	// Create HTTP client
+	// Create HTTP client with appropriate timeout
 	client := &http.Client{Timeout: 10 * time.Second}
 
-	// Fetch file from storage
+	// Fetch file from storage using internal URL
 	resp, err := client.Get(internalURL)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to fetch file: %v", err)})
@@ -77,18 +83,55 @@ func ServeMediaFile(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
-	// Set content type from metadata if available
-	if contentType, ok := media.Metadata["mime_type"].(string); ok {
-		c.Header("Content-Type", contentType)
+	// Get content type
+	contentType := ""
+	if ct, ok := media.Metadata["mime_type"].(string); ok {
+		contentType = ct
+	} else {
+		contentType = resp.Header.Get("Content-Type")
 	}
+
+	// Check if it's an image that needs resizing
+	if (width != "" || height != "") && strings.HasPrefix(contentType, "image/") {
+		// Parse dimensions
+		var w, h int
+		if width != "" {
+			w, _ = strconv.Atoi(width)
+		}
+		if height != "" {
+			h, _ = strconv.Atoi(height)
+		}
+
+		// Process image if valid dimensions
+		if w > 0 || h > 0 {
+			resizedImage, err := utils.ProcessImageWithSize(resp.Body, w, h, fit)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to process image: %v", err)})
+				return
+			}
+
+			// Set headers
+			c.Header("Content-Type", contentType)
+			if originalName, ok := media.Metadata["original_name"].(string); ok {
+				c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", originalName))
+			}
+
+			// Write the processed image
+			c.Writer.Write(resizedImage)
+			return
+		}
+	}
+
+	// Set content type
+	c.Header("Content-Type", contentType)
 
 	// Set filename for download
 	if originalName, ok := media.Metadata["original_name"].(string); ok {
 		c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", originalName))
 	}
 
-	// Stream the file to the response
-	c.DataFromReader(http.StatusOK, resp.ContentLength, resp.Header.Get("Content-Type"), resp.Body, nil)
+	// Stream the original file
+	c.DataFromReader(http.StatusOK, resp.ContentLength, contentType, resp.Body, nil)
 }
 
 func UploadMedia(c *gin.Context) {
@@ -106,6 +149,13 @@ func UploadMedia(c *gin.Context) {
 		return
 	}
 
+	// Extract detailed metadata
+	mediaMetadata, err := utils.ExtractMetadata(file)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to extract metadata: %v", err)})
+		return
+	}
+
 	// Initialize storage
 	storageProvider, err := initializeStorage()
 	if err != nil {
@@ -120,8 +170,9 @@ func UploadMedia(c *gin.Context) {
 		return
 	}
 
-	// Get the public URL for the file
-	fileURL := storageProvider.GetURL(fileID)
+	// Get both internal and public URLs for the file
+	fileInternalURL := storageProvider.GetInternalURL(fileID)
+	filePublicURL := storageProvider.GetURL(fileID)
 
 	// Get folder ID if provided
 	folderID := c.PostForm("folder_id")
@@ -153,23 +204,22 @@ func UploadMedia(c *gin.Context) {
 			tags = append(tags, tag)
 		}
 	}
-	fileInternalURL := storageProvider.GetInternalURL(fileID)
 
-	// Create metadata with additional info
+	// Create metadata combining file info and technical metadata
 	metadata := models.JSON{
 		"original_name": file.Filename,
-		"mime_type":     file.Header.Get("Content-Type"),
-		"uploaded_at":   time.Now().Format(time.RFC3339),
 		"file_id":       fileID,
-		"file_url":      fileInternalURL,
+		"internal_url":  fileInternalURL,
+		"public_url":    filePublicURL,
+		"technical":     mediaMetadata,
 	}
 
 	// Save to database
 	media := models.Media{
 		Name:     file.Filename,
-		Type:     utils.GetFileType(file.Filename),
+		Type:     mediaMetadata.FileType,
 		Size:     file.Size,
-		URL:      fileURL,
+		URL:      fileID,
 		UserID:   userID.(uint),
 		FolderID: fID,
 		Metadata: metadata,
@@ -187,22 +237,27 @@ func UploadMedia(c *gin.Context) {
 	}
 	tx.Commit()
 
-	// // Add the public URL to the response
-	// media.Metadata["file_url"] = fileInternalURL
-
 	c.JSON(http.StatusOK, gin.H{
 		"message": "File uploaded successfully",
 		"media":   media,
 	})
 }
 
-// Add a helper method to get file URL
+// Add helper methods to get file URLs
 func getFileURL(mediaItem *models.Media) (string, error) {
 	storageProvider, err := initializeStorage()
 	if err != nil {
 		return "", err
 	}
 	return storageProvider.GetURL(mediaItem.URL), nil
+}
+
+func getFileInternalURL(mediaItem *models.Media) (string, error) {
+	storageProvider, err := initializeStorage()
+	if err != nil {
+		return "", err
+	}
+	return storageProvider.GetInternalURL(mediaItem.URL), nil
 }
 
 func ListMedia(c *gin.Context) {
@@ -274,7 +329,13 @@ func ListMedia(c *gin.Context) {
 			if media[i].Metadata == nil {
 				media[i].Metadata = models.JSON{}
 			}
-			media[i].Metadata["file_url"] = fileURL
+			media[i].Metadata["public_url"] = fileURL
+		}
+		if internalURL, err := getFileInternalURL(&media[i]); err == nil {
+			if media[i].Metadata == nil {
+				media[i].Metadata = models.JSON{}
+			}
+			media[i].Metadata["internal_url"] = internalURL
 		}
 	}
 

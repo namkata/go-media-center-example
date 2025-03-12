@@ -1,8 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/linxGnu/goseaweedfs"
 )
 
@@ -19,11 +22,16 @@ type StorageProvider string
 const (
 	SeaweedFS StorageProvider = "seaweedfs"
 	S3        StorageProvider = "s3"
+	// Default chunk size for multipart uploads (5MB)
+	DefaultChunkSize = 5 * 1024 * 1024
+	// Threshold for using multipart upload (10MB)
+	MultipartThreshold = 10 * 1024 * 1024
 )
 
 // Storage is the interface that wraps the basic storage operations
 type Storage interface {
 	Upload(file *multipart.FileHeader) (string, error)
+	MultipartUpload(file *multipart.FileHeader) (string, error)
 	Delete(filename string) error
 	GetURL(filename string) string
 	GetInternalURL(filename string) string
@@ -97,6 +105,11 @@ func NewS3Storage(config map[string]string) (*S3Storage, error) {
 
 // Upload implements Storage interface for SeaweedFSStorage
 func (s *SeaweedFSStorage) Upload(file *multipart.FileHeader) (string, error) {
+	// Use multipart upload for large files
+	if file.Size > MultipartThreshold {
+		return s.MultipartUpload(file)
+	}
+
 	f, err := file.Open()
 	if err != nil {
 		return "", fmt.Errorf("failed to open file: %v", err)
@@ -117,16 +130,65 @@ func (s *SeaweedFSStorage) Upload(file *multipart.FileHeader) (string, error) {
 	return filePart.FileID, nil
 }
 
+// MultipartUpload implements multipart upload for SeaweedFSStorage
+func (s *SeaweedFSStorage) MultipartUpload(file *multipart.FileHeader) (string, error) {
+	f, err := file.Open()
+	if err != nil {
+		return "", fmt.Errorf("failed to open file: %v", err)
+	}
+	defer f.Close()
+
+	// Create a buffer for reading chunks
+	buffer := make([]byte, DefaultChunkSize)
+	chunks := make([]string, 0)
+
+	for {
+		n, err := f.Read(buffer)
+		if err != nil && err != io.EOF {
+			return "", fmt.Errorf("failed to read file chunk: %v", err)
+		}
+		if n == 0 {
+			break
+		}
+
+		// Upload chunk
+		chunk := bytes.NewReader(buffer[:n])
+		filePart, err := s.client.Upload(
+			chunk,
+			fmt.Sprintf("%s.part%d", file.Filename, len(chunks)),
+			int64(n),
+			"",
+			"",
+		)
+		if err != nil {
+			// Cleanup uploaded chunks on error
+			for _, chunkID := range chunks {
+				s.client.DeleteFile(chunkID, nil)
+			}
+			return "", fmt.Errorf("failed to upload chunk: %v", err)
+		}
+		chunks = append(chunks, filePart.FileID)
+	}
+
+	// For SeaweedFS, we'll store the chunk IDs in the metadata
+	// The first chunk's ID will be the main file ID
+	if len(chunks) == 0 {
+		return "", fmt.Errorf("no chunks uploaded")
+	}
+
+	return chunks[0], nil
+}
+
 // GetURL implements Storage interface for SeaweedFSStorage
 func (s *SeaweedFSStorage) GetURL(fid string) string {
 	// Get file extension from metadata if available
 	ext := filepath.Ext(fid)
-	if ext == "" {
-		ext = ".bin" // default extension if none is found
-	}
 
 	// Generate a clean filename using the fid
-	cleanName := fmt.Sprintf("%s%s", filepath.Base(fid), ext)
+	cleanName := filepath.Base(fid)
+	if ext != "" {
+		cleanName = fmt.Sprintf("%s%s", cleanName, ext)
+	}
 	return fmt.Sprintf("%s/media/files/%s", s.publicURL, cleanName)
 }
 
@@ -147,6 +209,11 @@ func (s *SeaweedFSStorage) Delete(fid string) error {
 
 // Upload implements Storage interface for S3Storage
 func (s *S3Storage) Upload(file *multipart.FileHeader) (string, error) {
+	// Use multipart upload for large files
+	if file.Size > MultipartThreshold {
+		return s.MultipartUpload(file)
+	}
+
 	f, err := file.Open()
 	if err != nil {
 		return "", fmt.Errorf("failed to open file: %v", err)
@@ -162,6 +229,97 @@ func (s *S3Storage) Upload(file *multipart.FileHeader) (string, error) {
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to upload to S3: %v", err)
+	}
+
+	return filename, nil
+}
+
+// MultipartUpload implements multipart upload for S3Storage
+func (s *S3Storage) MultipartUpload(file *multipart.FileHeader) (string, error) {
+	f, err := file.Open()
+	if err != nil {
+		return "", fmt.Errorf("failed to open file: %v", err)
+	}
+	defer f.Close()
+
+	filename := filepath.Join("uploads", filepath.Base(file.Filename))
+
+	// Create multipart upload
+	createResp, err := s.client.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
+		Bucket: &s.bucket,
+		Key:    &filename,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create multipart upload: %v", err)
+	}
+
+	// Upload parts
+	var completedParts []types.CompletedPart
+	partNumber := int32(1)
+	buffer := make([]byte, DefaultChunkSize)
+
+	for {
+		n, err := f.Read(buffer)
+		if err != nil && err != io.EOF {
+			// Abort multipart upload on error
+			_, abortErr := s.client.AbortMultipartUpload(context.TODO(), &s3.AbortMultipartUploadInput{
+				Bucket:   &s.bucket,
+				Key:      &filename,
+				UploadId: createResp.UploadId,
+			})
+			if abortErr != nil {
+				return "", fmt.Errorf("failed to abort multipart upload: %v (original error: %v)", abortErr, err)
+			}
+			return "", fmt.Errorf("failed to read file chunk: %v", err)
+		}
+		if n == 0 {
+			break
+		}
+
+		// Upload part
+		currentPartNumber := partNumber
+		partInput := &s3.UploadPartInput{
+			Bucket:     &s.bucket,
+			Key:        &filename,
+			PartNumber: &currentPartNumber,
+			UploadId:   createResp.UploadId,
+			Body:       bytes.NewReader(buffer[:n]),
+		}
+
+		partResp, err := s.client.UploadPart(context.TODO(), partInput)
+		if err != nil {
+			// Abort multipart upload on error
+			_, abortErr := s.client.AbortMultipartUpload(context.TODO(), &s3.AbortMultipartUploadInput{
+				Bucket:   &s.bucket,
+				Key:      &filename,
+				UploadId: createResp.UploadId,
+			})
+			if abortErr != nil {
+				return "", fmt.Errorf("failed to abort multipart upload: %v (original error: %v)", abortErr, err)
+			}
+			return "", fmt.Errorf("failed to upload part: %v", err)
+		}
+
+		// Create a copy of partNumber for the CompletedPart
+		pnum := partNumber
+		completedParts = append(completedParts, types.CompletedPart{
+			ETag:       partResp.ETag,
+			PartNumber: &pnum,
+		})
+		partNumber++
+	}
+
+	// Complete multipart upload
+	_, err = s.client.CompleteMultipartUpload(context.TODO(), &s3.CompleteMultipartUploadInput{
+		Bucket:   &s.bucket,
+		Key:      &filename,
+		UploadId: createResp.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: completedParts,
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to complete multipart upload: %v", err)
 	}
 
 	return filename, nil
