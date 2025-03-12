@@ -179,9 +179,27 @@ clean: seaweed-clean
 	rm -rf bin/
 	rm -rf tmp/
 
+# Check if gtimeout is available, otherwise don't use timeout
+TIMEOUT_CMD := $(shell which gtimeout 2>/dev/null || echo "")
+ifneq ($(TIMEOUT_CMD),)
+    TIMEOUT = $(TIMEOUT_CMD) 300
+else
+    TIMEOUT = 
+endif
+
+install-deps:
+	@echo "Installing required Go packages..."
+	@$(TIMEOUT) go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest || (echo "Failed to install golangci-lint"; exit 1)
+	@$(TIMEOUT) go install github.com/golang-migrate/migrate/v4/cmd/migrate@latest || (echo "Failed to install migrate"; exit 1)
+	@$(TIMEOUT) go install github.com/swaggo/swag/cmd/swag@latest || (echo "Failed to install swag"; exit 1)
+	@$(TIMEOUT) go install github.com/go-delve/delve/cmd/dlv@latest || (echo "Failed to install delve"; exit 1)
+	@echo "All tools installed successfully"
+
 deps:
-	$(GOMOD) download
-	$(GOMOD) tidy
+	@echo "Downloading project dependencies..."
+	@$(TIMEOUT) $(GOMOD) download || (echo "Failed to download dependencies"; exit 1)
+	@$(TIMEOUT) $(GOMOD) tidy || (echo "Failed to tidy dependencies"; exit 1)
+	@echo "Dependencies updated successfully"
 
 .env:
 	cp .env.example .env

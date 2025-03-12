@@ -87,7 +87,7 @@ func Load() (*Config, error) {
 		Storage: StorageConfig{
 			Path:          getEnv("STORAGE_PATH", "./storage/media"),
 			MaxUploadSize: int64(getEnvAsInt("MAX_UPLOAD_SIZE", 10485760)),
-			Provider:      getEnv("STORAGE_PROVIDER", "local"),
+			Provider:      getEnv("STORAGE_PROVIDER", "seaweedfs"),
 			SeaweedFS: SeaweedFSConfig{
 				MasterURL:  getEnv("SEAWEEDFS_MASTER_URL", "http://localhost:9333"),
 				Container:  getEnv("SEAWEED_CONTAINER", "media-center-seaweedfs"),

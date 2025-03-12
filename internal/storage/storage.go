@@ -37,6 +37,7 @@ type Storage interface {
 	Delete(filename string) error
 	GetURL(filename string) string
 	GetInternalURL(filename string) string
+	GetPresignedURL(fileID string, expiration time.Duration) (string, error)
 }
 
 // SeaweedFSStorage implements Storage interface using SeaweedFS
@@ -381,4 +382,33 @@ func (s *S3Storage) Delete(filename string) error {
 		return fmt.Errorf("failed to delete from S3: %v", err)
 	}
 	return nil
+}
+
+// Update GetPresignedURL for SeaweedFSStorage
+func (s *SeaweedFSStorage) GetPresignedURL(fileID string, expiration time.Duration) (string, error) {
+    // Generate a token with expiration time
+    expirationTime := time.Now().Add(expiration).Unix()
+    token := fmt.Sprintf("exp=%d", expirationTime)
+    
+    // Construct URL with token
+    return fmt.Sprintf("%s/%s?%s", s.publicURL, fileID, token), nil
+}
+
+// Update GetPresignedURL for S3Storage
+func (s *S3Storage) GetPresignedURL(fileID string, expiration time.Duration) (string, error) {
+    presignClient := s3.NewPresignClient(s.client)
+    
+    request, err := presignClient.PresignGetObject(context.TODO(), &s3.GetObjectInput{
+        Bucket:          &s.bucket,
+        Key:            &fileID,
+        ResponseExpires: aws.Time(time.Now().Add(expiration)),
+    }, func(opts *s3.PresignOptions) {
+        opts.Expires = expiration
+    })
+    
+    if err != nil {
+        return "", fmt.Errorf("failed to generate presigned URL: %v", err)
+    }
+    
+    return request.URL, nil
 }

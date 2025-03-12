@@ -17,6 +17,10 @@ import (
 )
 
 // initializeStorage creates a new storage provider based on configuration
+const (
+    defaultURLExpiration = 24 * time.Hour // Default URL expiration time
+)
+
 func initializeStorage() (storage.Storage, error) {
 	cfg, err := config.Load()
 	if err != nil {
@@ -24,7 +28,7 @@ func initializeStorage() (storage.Storage, error) {
 	}
 
 	var provider storage.StorageProvider
-	switch cfg.Storage.Provider {
+	switch strings.ToLower(cfg.Storage.Provider) {
 	case "seaweedfs":
 		provider = storage.SeaweedFS
 	case "s3":
@@ -33,7 +37,6 @@ func initializeStorage() (storage.Storage, error) {
 		return nil, fmt.Errorf("unsupported storage provider: %s", cfg.Storage.Provider)
 	}
 
-	// Configure storage based on provider
 	storageConfig := make(map[string]string)
 
 	switch provider {
@@ -49,9 +52,16 @@ func initializeStorage() (storage.Storage, error) {
 			"access_key_id":     cfg.Storage.S3.AccessKeyID,
 			"secret_access_key": cfg.Storage.S3.SecretAccessKey,
 			"bucket":            cfg.Storage.S3.BucketName,
-			"public_url":        cfg.Storage.S3.PublicURL,
 			"endpoint":          cfg.Storage.S3.Endpoint,
-			"force_path_style":  fmt.Sprintf("%v", cfg.Storage.S3.ForcePathStyle),
+			"force_path_style":  "true",
+			"url_expiration":    defaultURLExpiration.String(),
+		}
+
+		// Set public URL if provided, otherwise construct it
+		if cfg.Storage.S3.PublicURL != "" {
+			storageConfig["public_url"] = cfg.Storage.S3.PublicURL
+		} else if cfg.Storage.S3.Endpoint != "" {
+			storageConfig["public_url"] = fmt.Sprintf("%s/%s", cfg.Storage.S3.Endpoint, cfg.Storage.S3.BucketName)
 		}
 	}
 
@@ -366,42 +376,62 @@ func ListMedia(c *gin.Context) {
 }
 
 func GetMedia(c *gin.Context) {
-	id := c.Param("id")
-	userID, _ := c.Get("user_id")
+    id := c.Param("id")
+    userID, _ := c.Get("user_id")
 
-	var media models.Media
-	if err := database.GetDB().
-		Preload("Tags").
-		Where("id = ? AND user_id = ?", id, userID).
-		First(&media).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Media not found: %v", err)})
-		return
-	}
+    // Get expiration from query parameter, default to 24 hours
+    expirationStr := c.DefaultQuery("expires", "86400") // 24 hours in seconds
+    expiration, err := strconv.Atoi(expirationStr)
+    if err != nil {
+        expiration = int(defaultURLExpiration.Seconds())
+    }
 
-	// Add file URL to the response
-	if fileURL, err := getFileURL(&media); err == nil {
-		if media.Metadata == nil {
-			media.Metadata = models.JSON{}
-		}
-		media.Metadata["file_url"] = fileURL
-	}
+    var media models.Media
+    if err := database.GetDB().
+        Preload("Tags").
+        Where("id = ? AND user_id = ?", id, userID).
+        First(&media).Error; err != nil {
+        c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Media not found: %v", err)})
+        return
+    }
 
-	// Get folder info if media is in a folder
-	if media.FolderID != nil {
-		var folder models.Folder
-		if err := database.GetDB().Select("id, name").First(&folder, media.FolderID).Error; err == nil {
-			c.JSON(http.StatusOK, gin.H{
-				"media": media,
-				"folder": gin.H{
-					"id":   folder.ID,
-					"name": folder.Name,
-				},
-			})
-			return
-		}
-	}
+    // Initialize storage for presigned URL
+    storageProvider, err := initializeStorage()
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to initialize storage: %v", err)})
+        return
+    }
 
-	c.JSON(http.StatusOK, gin.H{"media": media})
+    // Generate presigned URL
+    presignedURL, err := storageProvider.GetPresignedURL(media.URL, time.Duration(expiration)*time.Second)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to generate presigned URL: %v", err)})
+        return
+    }
+
+    // Add URLs to metadata
+    if media.Metadata == nil {
+        media.Metadata = models.JSON{}
+    }
+    media.Metadata["presigned_url"] = presignedURL
+    media.Metadata["expires_in"] = expiration
+
+    // Get folder info if media is in a folder
+    if media.FolderID != nil {
+        var folder models.Folder
+        if err := database.GetDB().Select("id, name").First(&folder, media.FolderID).Error; err == nil {
+            c.JSON(http.StatusOK, gin.H{
+                "media": media,
+                "folder": gin.H{
+                    "id":   folder.ID,
+                    "name": folder.Name,
+                },
+            })
+            return
+        }
+    }
+
+    c.JSON(http.StatusOK, gin.H{"media": media})
 }
 
 func UpdateMedia(c *gin.Context) {
