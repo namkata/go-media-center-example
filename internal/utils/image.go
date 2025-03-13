@@ -67,6 +67,16 @@ func (t *TransformationOptions) Validate() error {
 
 // TransformImage applies the specified transformations to an image
 func TransformImage(input io.Reader, options TransformationOptions) ([]byte, error) {
+
+	// If no parameter header
+	if options.Width == 0 && options.Height == 0 && options.Fit == "" && options.Crop == "" && options.Format == "" {
+		originalBytes, err := io.ReadAll(input)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read original image: %v", err)
+		}
+		return originalBytes, nil
+	}
+
 	// Decode the input image
 	src, format, err := image.Decode(input)
 	if err != nil {
@@ -121,6 +131,8 @@ func TransformImage(input io.Reader, options TransformationOptions) ([]byte, err
 		fmt.Printf("Final dimensions after resize: %dx%d\n", finalBounds.Dx(), finalBounds.Dy())
 	}
 
+	fmt.Println("Crop:", options.Crop)
+
 	// Handle cropping if specified
 	if options.Crop != "" {
 		currentBounds := transformed.Bounds()
@@ -129,22 +141,15 @@ func TransformImage(input io.Reader, options TransformationOptions) ([]byte, err
 
 		fmt.Printf("Pre-crop dimensions: %dx%d\n", currentWidth, currentHeight)
 
-		var cropWidth, cropHeight int
-		if options.Width > 0 && options.Height > 0 {
-			// Use specified dimensions for crop
-			cropWidth = options.Width
-			cropHeight = options.Height
-		} else {
-			// Use current dimensions
+		// Determine crop demesions
+		cropWidth := options.Width
+		cropHeight := options.Height
+
+		if cropWidth == 0 || cropWidth > currentWidth {
 			cropWidth = currentWidth
-			cropHeight = currentHeight
 		}
 
-		// Ensure crop dimensions don't exceed image size
-		if cropWidth > currentWidth {
-			cropWidth = currentWidth
-		}
-		if cropHeight > currentHeight {
+		if cropHeight == 0 || cropHeight > currentHeight {
 			cropHeight = currentHeight
 		}
 

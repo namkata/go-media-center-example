@@ -43,11 +43,12 @@ func setupProtectedRoutes(rg *gin.RouterGroup) {
 	media := rg.Group("/media")
 	{
 		media.POST("/upload", handlers.UploadMedia)
+		media.POST("/url", handlers.UploadMediaFromURL)
+		media.POST("/batch", handlers.BulkUploadMedia)
 		media.GET("/list", handlers.ListMedia)
-		media.GET("/:id", handlers.GetMedia)
 		media.PUT("/:id", handlers.UpdateMedia)
+		media.GET("/:id", handlers.GetMedia)
 		media.DELETE("/:id", handlers.DeleteMedia)
-		media.POST("/batch", handlers.HandleBatchOperation)
 
 		// Transform API Examples:
 		// 1. Basic resize:

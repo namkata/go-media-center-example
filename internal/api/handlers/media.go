@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -174,7 +176,7 @@ func UploadMedia(c *gin.Context) {
 		return
 	}
 
-	if file.Size > cfg.Storage.MaxUploadSize {
+	if file.Size > cfg.Storage.MaxUploadSize || file.Size == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "File too large"})
 		return
 	}
@@ -282,6 +284,434 @@ func UploadMedia(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message": "File uploaded successfully",
 		"media":   media,
+	})
+}
+
+// UploadMediaFromURL handles uploading media from a URL
+func UploadMediaFromURL(c *gin.Context) {
+	cfg, _ := config.Load()
+	userID, _ := c.Get("user_id")
+
+	var input struct {
+		URL      string   `json:"url" binding:"required"`
+		Filename string   `json:"filename"`
+		FolderID string   `json:"folder_id"`
+		Tags     []string `json:"tags"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid request: %v", err)})
+		return
+	}
+
+	// Download file from URL
+	client := &http.Client{
+		Timeout: 60 * time.Second, // Longer timeout for potentially large files
+	}
+	resp, err := client.Get(input.URL)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Failed to download from URL: %v", err)})
+		return
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Failed to download from URL: status code %d", resp.StatusCode)})
+		return
+	}
+
+	// Check content length if available and ensure it's not zero
+	if resp.ContentLength > cfg.Storage.MaxUploadSize || resp.ContentLength == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "File too large"})
+		return
+	}
+	contentType := resp.Header.Get("Content-Type")
+	// Determine filename if not provided
+	filename := input.Filename
+	if filename == "" {
+		// Try to get filename from URL
+		urlPath := resp.Request.URL.Path
+		filename = filepath.Base(urlPath)
+		if filename == "" || filename == "." || filename == "/" {
+			// Generate a timestamp-based filename with extension from content type
+			ext := ".bin"
+			contentType := resp.Header.Get("Content-Type")
+			if strings.HasPrefix(contentType, "image/") {
+				switch contentType {
+				case "image/jpeg":
+					ext = ".jpg"
+				case "image/png":
+					ext = ".png"
+				case "image/gif":
+					ext = ".gif"
+				case "image/webp":
+					ext = ".webp"
+				}
+			} else if strings.HasPrefix(contentType, "video/") {
+				switch contentType {
+				case "video/mp4":
+					ext = ".mp4"
+				case "video/quicktime":
+					ext = ".mov"
+				case "video/x-msvideo":
+					ext = ".avi"
+				}
+			}
+			filename = fmt.Sprintf("download_%d%s", time.Now().Unix(), ext)
+		}
+	}
+
+	// Initialize storage
+	storageProvider, err := initializeStorage()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to initialize storage: %v", err)})
+		return
+	}
+
+	// Upload file to storage
+	fileID, err := storageProvider.Upload(resp.Body, filename)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to upload file: %v", err)})
+		return
+	}
+
+	// Get file size and metadata
+	// We need to download the file again to get metadata
+	fileResp, err := client.Get(storageProvider.GetInternalURL(fileID))
+	if err != nil {
+		// Clean up the uploaded file if we can't get metadata
+		storageProvider.Delete(fileID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to process file: %v", err)})
+		return
+	}
+	defer fileResp.Body.Close()
+
+	// Create a temporary file to extract metadata
+	tempFile, err := os.CreateTemp("", "url-download-*")
+	if err != nil {
+		storageProvider.Delete(fileID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to process file: %v", err)})
+		return
+	}
+	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
+
+	// Copy the file content to the temp file
+	fileSize, err := io.Copy(tempFile, fileResp.Body)
+	if err != nil {
+		storageProvider.Delete(fileID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to process file: %v", err)})
+		return
+	}
+
+	// Check file size again and ensure it's not zero
+	if fileSize > cfg.Storage.MaxUploadSize || fileSize == 0 {
+		storageProvider.Delete(fileID)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "File too large"})
+		return
+	}
+
+	// Rewind the temp file
+	tempFile.Seek(0, 0)
+
+	// Read the first 512 bytes to detect content type
+	buffer := make([]byte, 512)
+	_, err = tempFile.Read(buffer)
+	if err != nil && err != io.EOF {
+		storageProvider.Delete(fileID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to process file: %v", err)})
+		return
+	}
+
+	// Reset file pointer
+	tempFile.Seek(0, 0)
+
+	// // Detect content type
+	// contentType := http.DetectContentType(buffer)
+
+	// Create basic metadata
+	mediaMetadata := &utils.MediaMetadata{
+		FileType:   utils.GetFileType(filename),
+		MimeType:   contentType,
+		Size:       fileSize,
+		UploadedAt: time.Now().Format(time.RFC3339),
+		Format:     strings.TrimPrefix(filepath.Ext(filename), "."),
+	}
+
+	// Get both internal and public URLs for the file
+	fileInternalURL := storageProvider.GetInternalURL(fileID)
+	filePublicURL := storageProvider.GetPublicURL(fileID)
+
+	// Handle folder ID if provided
+	var fID *string
+	if input.FolderID != "" {
+		fID = &input.FolderID
+		// Verify folder exists and belongs to user
+		var folder models.Folder
+		if err := database.GetDB().Where("id = ? AND user_id = ?", input.FolderID, userID).First(&folder).Error; err != nil {
+			storageProvider.Delete(fileID)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid folder ID"})
+			return
+		}
+	}
+
+	// Handle tags if provided
+	var tags []models.Tag
+	if len(input.Tags) > 0 {
+		for _, name := range input.Tags {
+			var tag models.Tag
+			// Find or create tag
+			result := database.GetDB().Where("name = ?", name).FirstOrCreate(&tag, models.Tag{Name: name})
+			if result.Error != nil {
+				storageProvider.Delete(fileID)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process tags"})
+				return
+			}
+			tags = append(tags, tag)
+		}
+	}
+
+	// Create metadata combining file info and technical metadata
+	metadata := map[string]interface{}{
+		"original_name": filename,
+		"source_url":    input.URL,
+		"file_id":       fileID,
+		"internal_url":  fileInternalURL,
+		"public_url":    filePublicURL,
+		"technical":     mediaMetadata,
+	}
+
+	// Convert metadata to JSON
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		storageProvider.Delete(fileID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to marshal metadata: %v", err)})
+		return
+	}
+
+	// Save to database
+	media := models.Media{
+		ID:       fileID,
+		UserID:   userID.(uint),
+		FolderID: fID,
+		Filename: filename,
+		Path:     fileID,
+		MimeType: mediaMetadata.MimeType,
+		Size:     fileSize,
+		Metadata: metadataJSON,
+	}
+
+	// Create with transaction
+	tx := database.GetDB().Begin()
+	if err := tx.Model(&models.Media{}).Create(&media).Error; err != nil {
+		tx.Rollback()
+		// Clean up uploaded file
+		storageProvider.Delete(fileID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to save media metadata: %v", err)})
+		return
+	}
+
+	// Associate tags if any
+	if len(tags) > 0 {
+		if err := tx.Model(&media).Association("Tags").Append(&tags); err != nil {
+			tx.Rollback()
+			storageProvider.Delete(fileID)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to associate tags"})
+			return
+		}
+	}
+
+	tx.Commit()
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "File uploaded successfully from URL",
+		"media":   media,
+	})
+}
+
+// BulkUploadMedia handles uploading multiple files at once
+func BulkUploadMedia(c *gin.Context) {
+	cfg, _ := config.Load()
+	userID, _ := c.Get("user_id")
+
+	// Get folder ID if provided
+	folderID := c.PostForm("folder_id")
+	var fID *string
+	if folderID != "" {
+		fID = &folderID
+		// Verify folder exists and belongs to user
+		var folder models.Folder
+		if err := database.GetDB().Where("id = ? AND user_id = ?", folderID, userID).First(&folder).Error; err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid folder ID"})
+			return
+		}
+	}
+
+	// Get tags if provided
+	var tags []models.Tag
+	if tagNames := c.PostFormArray("tags"); len(tagNames) > 0 {
+		for _, name := range tagNames {
+			var tag models.Tag
+			// Find or create tag
+			result := database.GetDB().Where("name = ?", name).FirstOrCreate(&tag, models.Tag{Name: name})
+			if result.Error != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process tags"})
+				return
+			}
+			tags = append(tags, tag)
+		}
+	}
+
+	// Initialize storage
+	storageProvider, err := initializeStorage()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to initialize storage: %v", err)})
+		return
+	}
+
+	// Get form files
+	form, err := c.MultipartForm()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to parse form"})
+		return
+	}
+
+	files := form.File["files"]
+	if len(files) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No files uploaded"})
+		return
+	}
+
+	results := make([]gin.H, 0, len(files))
+	successCount := 0
+
+	for _, file := range files {
+		// Check file size
+		if file.Size > cfg.Storage.MaxUploadSize {
+			results = append(results, gin.H{
+				"filename": file.Filename,
+				"success":  false,
+				"error":    "File too large",
+			})
+			continue
+		}
+
+		// Extract detailed metadata
+		mediaMetadata, err := utils.ExtractMetadata(file)
+		if err != nil {
+			results = append(results, gin.H{
+				"filename": file.Filename,
+				"success":  false,
+				"error":    fmt.Sprintf("Failed to extract metadata: %v", err),
+			})
+			continue
+		}
+
+		// Open the file for reading
+		f, err := file.Open()
+		if err != nil {
+			results = append(results, gin.H{
+				"filename": file.Filename,
+				"success":  false,
+				"error":    fmt.Sprintf("Failed to open file: %v", err),
+			})
+			continue
+		}
+
+		// Upload file to storage
+		fileID, err := storageProvider.Upload(f, file.Filename)
+		f.Close() // Close file after upload
+
+		if err != nil {
+			results = append(results, gin.H{
+				"filename": file.Filename,
+				"success":  false,
+				"error":    fmt.Sprintf("Failed to upload file: %v", err),
+			})
+			continue
+		}
+
+		// Get both internal and public URLs for the file
+		fileInternalURL := storageProvider.GetInternalURL(fileID)
+		filePublicURL := storageProvider.GetPublicURL(fileID)
+
+		// Create metadata combining file info and technical metadata
+		metadata := map[string]interface{}{
+			"original_name": file.Filename,
+			"file_id":       fileID,
+			"internal_url":  fileInternalURL,
+			"public_url":    filePublicURL,
+			"technical":     mediaMetadata,
+		}
+
+		// Convert metadata to JSON
+		metadataJSON, err := json.Marshal(metadata)
+		if err != nil {
+			storageProvider.Delete(fileID)
+			results = append(results, gin.H{
+				"filename": file.Filename,
+				"success":  false,
+				"error":    fmt.Sprintf("Failed to marshal metadata: %v", err),
+			})
+			continue
+		}
+
+		// Save to database
+		media := models.Media{
+			ID:       fileID,
+			UserID:   userID.(uint),
+			FolderID: fID,
+			Filename: file.Filename,
+			Path:     fileID,
+			MimeType: mediaMetadata.MimeType,
+			Size:     file.Size,
+			Metadata: metadataJSON,
+		}
+
+		// Create with transaction
+		tx := database.GetDB().Begin()
+		if err := tx.Model(&models.Media{}).Create(&media).Error; err != nil {
+			tx.Rollback()
+			// Clean up uploaded file
+			storageProvider.Delete(fileID)
+			results = append(results, gin.H{
+				"filename": file.Filename,
+				"success":  false,
+				"error":    fmt.Sprintf("Failed to save media metadata: %v", err),
+			})
+			continue
+		}
+
+		// Associate tags if any
+		if len(tags) > 0 {
+			if err := tx.Model(&media).Association("Tags").Append(&tags); err != nil {
+				tx.Rollback()
+				storageProvider.Delete(fileID)
+				results = append(results, gin.H{
+					"filename": file.Filename,
+					"success":  false,
+					"error":    "Failed to associate tags",
+				})
+				continue
+			}
+		}
+
+		tx.Commit()
+		successCount++
+
+		results = append(results, gin.H{
+			"filename": file.Filename,
+			"success":  true,
+			"media_id": media.ID,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":       "Bulk upload completed",
+		"total":         len(files),
+		"success_count": successCount,
+		"results":       results,
 	})
 }
 
@@ -569,6 +999,14 @@ func TransformMedia(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
+	// var media models.Media
+	// if err := database.GetDB().
+	// 	Preload("Tags").
+	// 	Where("id = ? AND user_id = ?", mediaID, userID).
+	// 	First(&media).Error; err != nil {
+	// 	c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Media not found: %v", err)})
+	// 	return
+	// }
 
 	// Check if media is an image
 	if !strings.HasPrefix(media.MimeType, "image/") {

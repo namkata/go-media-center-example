@@ -4,6 +4,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"log"
 	"time"
 
 	"go-media-center-example/internal/database"
@@ -84,10 +85,17 @@ func GetMediaByID(id string) (*Media, error) {
 		return nil, errors.New("database connection not initialized")
 	}
 
-	result := db.Model(&Media{}).First(&media, "id = ?", id)
-	if result.Error != nil {
+	log.Printf("Fetching media with ID: %s", id)
+	result := db.Table(media.TableName()).Where("id = ?", id).First(&media)
+
+	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		log.Println("No media found for the given ID")
+		return nil, nil // No error, but media is not found
+	} else if result.Error != nil {
+		log.Printf("Error fetching media: %v", result.Error)
 		return nil, result.Error
 	}
+
 	return &media, nil
 }
 

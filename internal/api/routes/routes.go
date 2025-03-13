@@ -25,6 +25,8 @@ func SetupRoutes(router *gin.Engine) {
 	media := api.Group("/media")
 	{
 		media.POST("", handlers.UploadMedia)
+		media.POST("/url", handlers.UploadMediaFromURL)
+		media.POST("/bulk", handlers.BulkUploadMedia)
 		media.GET("", handlers.ListMedia)
 		media.GET("/:id", handlers.GetMedia)
 		media.GET("/:id/transform", handlers.TransformMedia)

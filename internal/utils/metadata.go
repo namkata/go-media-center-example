@@ -226,3 +226,47 @@ func SaveTempFile(f multipart.File) (string, error) {
 func GetMimeType(buffer []byte) string {
 	return http.DetectContentType(buffer)
 }
+
+func DetectMimeType(resp *http.Response, file io.ReadSeeker, filename string) string {
+	// 1. Try detecting from file content
+	buffer := make([]byte, 512)
+	file.Seek(0, 0) // Reset reader before reading
+	_, err := file.Read(buffer)
+	file.Seek(0, 0) // Reset after reading
+
+	if err == nil {
+		mimeType := http.DetectContentType(buffer)
+		if mimeType != "application/octet-stream" { // Not generic binary
+			return mimeType
+		}
+	}
+
+	// 2. Try Content-Type from response headers
+	if resp != nil {
+		mimeType := resp.Header.Get("Content-Type")
+		if mimeType != "" {
+			return mimeType
+		}
+	}
+
+	// 3. Infer from file extension
+	ext := strings.ToLower(filepath.Ext(filename))
+	mimeTypes := map[string]string{
+		".jpg":  "image/jpeg",
+		".jpeg": "image/jpeg",
+		".png":  "image/png",
+		".gif":  "image/gif",
+		".webp": "image/webp",
+		".mp4":  "video/mp4",
+		".mov":  "video/quicktime",
+		".avi":  "video/x-msvideo",
+		".pdf":  "application/pdf",
+		".txt":  "text/plain",
+	}
+
+	if mimeType, found := mimeTypes[ext]; found {
+		return mimeType
+	}
+
+	return "application/octet-stream" // Default fallback
+}

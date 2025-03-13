@@ -51,10 +51,14 @@ type S3Storage struct {
 // Upload uploads a file to S3
 func (s *S3Storage) Upload(reader io.Reader, filename string) (string, error) {
 	key := filepath.Clean(filename)
-	_, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return "", fmt.Errorf("failed to read file: %v", err)
+	}
+	_, err = s.client.PutObject(context.Background(), &s3.PutObjectInput{
+		Body:   bytes.NewReader(data),
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
-		Body:   reader,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to upload file to S3: %v", err)
@@ -103,9 +107,9 @@ func (s *S3Storage) GetInternalURL(path string) string {
 func (s *S3Storage) UploadBytes(data []byte, filename string) (string, error) {
 	key := filepath.Clean(filename)
 	_, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
+		Body:   bytes.NewReader(data),
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
-		Body:   bytes.NewReader(data),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to upload bytes to S3: %v", err)
