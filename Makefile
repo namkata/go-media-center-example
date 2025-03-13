@@ -34,19 +34,31 @@ SEAWEED_REPLICAS?=1
 all: build
 # LocalStack management
 localstack-start:
-	@echo "Starting LocalStack container..."
-	@docker run -d \
-		--name $(LOCALSTACK_CONTAINER) \
-		-p $(LOCALSTACK_PORT):4566 \
-		-p 4510-4559:4510-4559 \
-		-e SERVICES=s3 \
-		-e DEFAULT_REGION=$(AWS_REGION) \
-		-e AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY_ID) \
-		-e AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY) \
-		localstack/localstack:$(LOCALSTACK_VERSION)
-	@echo "Waiting for LocalStack to be ready..."
-	@sleep 10
+	@echo "Starting LocalStack..."
+	@if [ ! $$(docker ps -q -f name=$(LOCALSTACK_CONTAINER)) ]; then \
+		if [ ! $$(docker ps -aq -f status=exited -f name=$(LOCALSTACK_CONTAINER)) ]; then \
+			docker run -d \
+				--name $(LOCALSTACK_CONTAINER) \
+				-p $(LOCALSTACK_PORT):4566 \
+				-p 4510-4559:4510-4559 \
+				-e SERVICES=s3 \
+				-e DEFAULT_REGION=$(AWS_REGION) \
+				-e AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY_ID) \
+				-e AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY) \
+				localstack/localstack:$(LOCALSTACK_VERSION); \
+			echo "Waiting for LocalStack to be ready..."; \
+			sleep 10; \
+		else \
+			docker start $(LOCALSTACK_CONTAINER); \
+			echo "Waiting for LocalStack to be ready..."; \
+			sleep 10; \
+		fi \
+	else \
+		echo "LocalStack is already running"; \
+	fi
 	@make localstack-create-bucket
+	@echo "LocalStack started with:"
+	@echo "Endpoint URL: http://localhost:$(LOCALSTACK_PORT)"
 
 localstack-stop:
 	@echo "Stopping LocalStack container..."
@@ -76,7 +88,10 @@ dev-setup: localstack-start
 	@echo "Development environment setup complete"
 
 # Clean up
-clean: localstack-stop
+clean: localstack-stop seaweed-clean
+	@echo "Cleaning up build artifacts..."
+	@rm -rf bin/
+	@rm -rf tmp/
 	@echo "Clean up complete"
 
 # SeaweedFS commands
@@ -133,17 +148,18 @@ seaweed-logs:
 		echo "SeaweedFS is not running"; \
 	fi
 
-seaweed-clean: seaweed-stop
+seaweed-clean:
 	@echo "Cleaning up SeaweedFS..."
 	@if [ $$(docker ps -aq -f name=$(SEAWEED_CONTAINER)) ]; then \
-		docker rm $(SEAWEED_CONTAINER); \
+		docker rm -f $(SEAWEED_CONTAINER) || true; \
 	fi
 	@if [ $$(docker volume ls -q -f name=$(SEAWEED_VOLUME)) ]; then \
-		docker volume rm $(SEAWEED_VOLUME); \
+		docker volume rm $(SEAWEED_VOLUME) || true; \
 	fi
 
 # Existing commands
-run: seaweed-start
+run: localstack-start seaweed-start
+	@echo "Starting application..."
 	$(GORUN) $(MAIN_PATH)
 
 build:
@@ -154,30 +170,31 @@ test:
 
 migrate:
 	@echo "Running database migrations..."
-	@if [ ! -d "database/migrations" ]; then \
-		echo "Creating migrations directory..."; \
-		mkdir -p database/migrations; \
-	fi
-	PGPASSWORD=$(DB_PASSWORD) psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME) -f database/migrations/*.sql
-	@echo "Migrations completed successfully"
+	@chmod +x scripts/migrate.sh
+	@./scripts/migrate.sh up
+
+migrate-down:
+	@echo "Rolling back database migrations..."
+	@chmod +x scripts/migrate.sh
+	@./scripts/migrate.sh down
+
+migrate-reset:
+	@echo "Resetting database..."
+	@chmod +x scripts/migrate.sh
+	@./scripts/migrate.sh reset
 
 migrate-create:
 	@read -p "Enter migration name: " name; \
 	timestamp=`date +%Y%m%d%H%M%S`; \
-	filename="database/migrations/$${timestamp}_$${name}.sql"; \
-	touch $$filename; \
-	echo "Created migration file: $$filename"
-
-migrate-rollback:
-	@echo "Rolling back last migration..."
-	psql -U postgres -d media_center -c "SELECT rollback_migration();"
+	up_file="database/migrations/$${timestamp}_$${name}.sql"; \
+	down_file="database/migrations/$${timestamp}_$${name}_down.sql"; \
+	touch $$up_file $$down_file; \
+	echo "Created migration files:"; \
+	echo "  Up: $$up_file"; \
+	echo "  Down: $$down_file"
 
 lint:
 	golangci-lint run
-
-clean: seaweed-clean
-	rm -rf bin/
-	rm -rf tmp/
 
 # Check if gtimeout is available, otherwise don't use timeout
 TIMEOUT_CMD := $(shell which gtimeout 2>/dev/null || echo "")

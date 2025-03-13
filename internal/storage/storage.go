@@ -5,17 +5,17 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"mime/multipart"
-	"net/http"
+	"net/url"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/linxGnu/goseaweedfs"
+
+	"go-media-center-example/internal/config"
 )
 
 // StorageProvider represents the type of storage being used
@@ -30,134 +30,127 @@ const (
 	MultipartThreshold = 10 * 1024 * 1024
 )
 
-// Storage is the interface that wraps the basic storage operations
+// Storage defines the interface for storage providers
 type Storage interface {
-	Upload(file *multipart.FileHeader) (string, error)
-	MultipartUpload(file *multipart.FileHeader) (string, error)
-	Delete(filename string) error
-	GetURL(filename string) string
-	GetInternalURL(filename string) string
+	Upload(reader io.Reader, filename string) (string, error)
+	Download(path string) (io.ReadCloser, error)
+	Delete(path string) error
+	GetPublicURL(path string) string
+	GetInternalURL(path string) string
+	UploadBytes(data []byte, filename string) (string, error)
 	GetPresignedURL(fileID string, expiration time.Duration) (string, error)
 }
 
-// SeaweedFSStorage implements Storage interface using SeaweedFS
+// S3Storage implements the Storage interface for AWS S3
+type S3Storage struct {
+	client    *s3.Client
+	bucket    string
+	publicURL string
+}
+
+// Upload uploads a file to S3
+func (s *S3Storage) Upload(reader io.Reader, filename string) (string, error) {
+	key := filepath.Clean(filename)
+	_, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		Body:   reader,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to upload file to S3: %v", err)
+	}
+	return key, nil
+}
+
+// Download downloads a file from S3
+func (s *S3Storage) Download(path string) (io.ReadCloser, error) {
+	result, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(path),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to download file from S3: %v", err)
+	}
+	return result.Body, nil
+}
+
+// Delete deletes a file from S3
+func (s *S3Storage) Delete(path string) error {
+	_, err := s.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(path),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete file from S3: %v", err)
+	}
+	return nil
+}
+
+// GetPublicURL returns the public URL for a file in S3
+func (s *S3Storage) GetPublicURL(path string) string {
+	if s.publicURL != "" {
+		return fmt.Sprintf("%s/%s", s.publicURL, path)
+	}
+	return fmt.Sprintf("https://%s.s3.amazonaws.com/%s", s.bucket, path)
+}
+
+// GetInternalURL returns the internal URL for a file in S3
+func (s *S3Storage) GetInternalURL(path string) string {
+	return fmt.Sprintf("https://%s.s3.amazonaws.com/%s", s.bucket, path)
+}
+
+// UploadBytes uploads bytes to S3
+func (s *S3Storage) UploadBytes(data []byte, filename string) (string, error) {
+	key := filepath.Clean(filename)
+	_, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(data),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to upload bytes to S3: %v", err)
+	}
+	return key, nil
+}
+
+// GetPresignedURL generates a presigned URL for S3
+func (s *S3Storage) GetPresignedURL(fileID string, expiration time.Duration) (string, error) {
+	presignClient := s3.NewPresignClient(s.client)
+	request, err := presignClient.PresignGetObject(context.Background(), &s3.GetObjectInput{
+		Bucket:          aws.String(s.bucket),
+		Key:             aws.String(fileID),
+		ResponseExpires: aws.Time(time.Now().Add(expiration)),
+	}, func(opts *s3.PresignOptions) {
+		opts.Expires = expiration
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to generate presigned URL: %v", err)
+	}
+	return request.URL, nil
+}
+
+// SeaweedFSStorage implements the Storage interface for SeaweedFS
 type SeaweedFSStorage struct {
-	client      *goseaweedfs.Seaweed
-	masterURL   string
+	client      *goseaweedfs.Filer
 	internalURL string
 	publicURL   string
 }
 
-// S3Storage implements Storage interface using AWS S3
-type S3Storage struct {
-	client    *s3.Client
-	bucket    string
-	region    string
-	publicURL string
-}
-
-// NewStorage creates a new storage instance based on the provider
-func NewStorage(provider StorageProvider, config map[string]string) (Storage, error) {
-	switch provider {
-	case SeaweedFS:
-		return NewSeaweedFSStorage(config)
-	case S3:
-		return NewS3Storage(config)
-	default:
-		return nil, fmt.Errorf("unsupported storage provider: %s", provider)
-	}
-}
-
-// NewSeaweedFSStorage creates a new SeaweedFS storage instance
-func NewSeaweedFSStorage(config map[string]string) (*SeaweedFSStorage, error) {
-	client, err := goseaweedfs.NewSeaweed(
-		config["master_url"],
-		[]string{},
-		int64(10), // timeout in seconds
-		&http.Client{Timeout: 10 * time.Second},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create SeaweedFS client: %v", err)
-	}
-
-	return &SeaweedFSStorage{
-		client:      client,
-		masterURL:   config["master_url"],
-		internalURL: config["internal_url"],
-		publicURL:   config["public_url"],
-	}, nil
-}
-
-// NewS3Storage creates a new S3 storage instance
-func NewS3Storage(config map[string]string) (*S3Storage, error) {
-	var options []func(*awsconfig.LoadOptions) error
-
-	// Add region
-	options = append(options, awsconfig.WithRegion(config["region"]))
-
-	// Add credentials if provided
-	if config["access_key_id"] != "" && config["secret_access_key"] != "" {
-		options = append(options, awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(
-				config["access_key_id"],
-				config["secret_access_key"],
-				"",
-			),
-		))
-	}
-
-	// Add custom endpoint if provided
-	if config["endpoint"] != "" {
-		customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			return aws.Endpoint{
-				URL:               config["endpoint"],
-				SigningRegion:     config["region"],
-				HostnameImmutable: true,
-			}, nil
-		})
-		options = append(options, awsconfig.WithEndpointResolverWithOptions(customResolver))
-	}
-
-	// Load AWS configuration
-	awsCfg, err := awsconfig.LoadDefaultConfig(context.TODO(), options...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config: %v", err)
-	}
-
-	// Create S3 client with options
-	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		if config["force_path_style"] == "true" {
-			o.UsePathStyle = true
-		}
-	})
-
-	return &S3Storage{
-		client:    s3Client,
-		bucket:    config["bucket"],
-		region:    config["region"],
-		publicURL: config["public_url"],
-	}, nil
-}
-
 // Upload implements Storage interface for SeaweedFSStorage
-func (s *SeaweedFSStorage) Upload(file *multipart.FileHeader) (string, error) {
-	// Use multipart upload for large files
-	if file.Size > MultipartThreshold {
-		return s.MultipartUpload(file)
-	}
-
-	f, err := file.Open()
+func (s *SeaweedFSStorage) Upload(reader io.Reader, filename string) (string, error) {
+	// Read the entire file into memory since SeaweedFS client doesn't support streaming
+	data, err := io.ReadAll(reader)
 	if err != nil {
-		return "", fmt.Errorf("failed to open file: %v", err)
+		return "", fmt.Errorf("failed to read file: %v", err)
 	}
-	defer f.Close()
 
+	// Upload the file
 	filePart, err := s.client.Upload(
-		f,
-		file.Filename,
-		file.Size,
-		"",
-		"",
+		bytes.NewReader(data),
+		int64(len(data)), // size
+		filename,         // path
+		"default",        // collection
+		"",               // ttl
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to upload to SeaweedFS: %v", err)
@@ -166,249 +159,148 @@ func (s *SeaweedFSStorage) Upload(file *multipart.FileHeader) (string, error) {
 	return filePart.FileID, nil
 }
 
-// MultipartUpload implements multipart upload for SeaweedFSStorage
-func (s *SeaweedFSStorage) MultipartUpload(file *multipart.FileHeader) (string, error) {
-	f, err := file.Open()
+// Download downloads a file from SeaweedFS
+func (s *SeaweedFSStorage) Download(path string) (io.ReadCloser, error) {
+	reader, _, err := s.client.Get(path, url.Values{}, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to open file: %v", err)
+		return nil, fmt.Errorf("failed to download file from SeaweedFS: %v", err)
 	}
-	defer f.Close()
-
-	// Create a buffer for reading chunks
-	buffer := make([]byte, DefaultChunkSize)
-	chunks := make([]string, 0)
-
-	for {
-		n, err := f.Read(buffer)
-		if err != nil && err != io.EOF {
-			return "", fmt.Errorf("failed to read file chunk: %v", err)
-		}
-		if n == 0 {
-			break
-		}
-
-		// Upload chunk
-		chunk := bytes.NewReader(buffer[:n])
-		filePart, err := s.client.Upload(
-			chunk,
-			fmt.Sprintf("%s.part%d", file.Filename, len(chunks)),
-			int64(n),
-			"",
-			"",
-		)
-		if err != nil {
-			// Cleanup uploaded chunks on error
-			for _, chunkID := range chunks {
-				s.client.DeleteFile(chunkID, nil)
-			}
-			return "", fmt.Errorf("failed to upload chunk: %v", err)
-		}
-		chunks = append(chunks, filePart.FileID)
-	}
-
-	// For SeaweedFS, we'll store the chunk IDs in the metadata
-	// The first chunk's ID will be the main file ID
-	if len(chunks) == 0 {
-		return "", fmt.Errorf("no chunks uploaded")
-	}
-
-	return chunks[0], nil
+	return io.NopCloser(bytes.NewReader(reader)), nil
 }
 
-// GetURL implements Storage interface for SeaweedFSStorage
-func (s *SeaweedFSStorage) GetURL(fid string) string {
-	// Get file extension from metadata if available
-	ext := filepath.Ext(fid)
-
-	// Generate a clean filename using the fid
-	cleanName := filepath.Base(fid)
-	if ext != "" {
-		cleanName = fmt.Sprintf("%s%s", cleanName, ext)
-	}
-	return fmt.Sprintf("%s/media/files/%s", s.publicURL, cleanName)
-}
-
-// GetInternalURL implements Storage interface for SeaweedFSStorage
-func (s *SeaweedFSStorage) GetInternalURL(fid string) string {
-	// For internal access, use the volume server's URL directly
-	return fmt.Sprintf("%s/%s", s.internalURL, fid)
-}
-
-// Delete implements Storage interface for SeaweedFSStorage
-func (s *SeaweedFSStorage) Delete(fid string) error {
-	err := s.client.DeleteFile(fid, nil)
-	if err != nil {
-		return fmt.Errorf("failed to delete from SeaweedFS: %v", err)
+// Delete deletes a file from SeaweedFS
+func (s *SeaweedFSStorage) Delete(path string) error {
+	if err := s.client.Delete(path, url.Values{}); err != nil {
+		return fmt.Errorf("failed to delete file from SeaweedFS: %v", err)
 	}
 	return nil
 }
 
-// Upload implements Storage interface for S3Storage
-func (s *S3Storage) Upload(file *multipart.FileHeader) (string, error) {
-	// Use multipart upload for large files
-	if file.Size > MultipartThreshold {
-		return s.MultipartUpload(file)
-	}
-
-	f, err := file.Open()
-	if err != nil {
-		return "", fmt.Errorf("failed to open file: %v", err)
-	}
-	defer f.Close()
-
-	filename := filepath.Join("uploads", filepath.Base(file.Filename))
-
-	_, err = s.client.PutObject(context.TODO(), &s3.PutObjectInput{
-		Bucket: &s.bucket,
-		Key:    &filename,
-		Body:   f,
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to upload to S3: %v", err)
-	}
-
-	return filename, nil
+// GetPublicURL returns the public URL for a file in SeaweedFS
+func (s *SeaweedFSStorage) GetPublicURL(path string) string {
+	return fmt.Sprintf("%s/%s", s.publicURL, path)
 }
 
-// MultipartUpload implements multipart upload for S3Storage
-func (s *S3Storage) MultipartUpload(file *multipart.FileHeader) (string, error) {
-	f, err := file.Open()
-	if err != nil {
-		return "", fmt.Errorf("failed to open file: %v", err)
-	}
-	defer f.Close()
-
-	filename := filepath.Join("uploads", filepath.Base(file.Filename))
-
-	// Create multipart upload
-	createResp, err := s.client.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
-		Bucket: &s.bucket,
-		Key:    &filename,
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to create multipart upload: %v", err)
-	}
-
-	// Upload parts
-	var completedParts []types.CompletedPart
-	partNumber := int32(1)
-	buffer := make([]byte, DefaultChunkSize)
-
-	for {
-		n, err := f.Read(buffer)
-		if err != nil && err != io.EOF {
-			// Abort multipart upload on error
-			_, abortErr := s.client.AbortMultipartUpload(context.TODO(), &s3.AbortMultipartUploadInput{
-				Bucket:   &s.bucket,
-				Key:      &filename,
-				UploadId: createResp.UploadId,
-			})
-			if abortErr != nil {
-				return "", fmt.Errorf("failed to abort multipart upload: %v (original error: %v)", abortErr, err)
-			}
-			return "", fmt.Errorf("failed to read file chunk: %v", err)
-		}
-		if n == 0 {
-			break
-		}
-
-		// Upload part
-		currentPartNumber := partNumber
-		partInput := &s3.UploadPartInput{
-			Bucket:     &s.bucket,
-			Key:        &filename,
-			PartNumber: &currentPartNumber,
-			UploadId:   createResp.UploadId,
-			Body:       bytes.NewReader(buffer[:n]),
-		}
-
-		partResp, err := s.client.UploadPart(context.TODO(), partInput)
-		if err != nil {
-			// Abort multipart upload on error
-			_, abortErr := s.client.AbortMultipartUpload(context.TODO(), &s3.AbortMultipartUploadInput{
-				Bucket:   &s.bucket,
-				Key:      &filename,
-				UploadId: createResp.UploadId,
-			})
-			if abortErr != nil {
-				return "", fmt.Errorf("failed to abort multipart upload: %v (original error: %v)", abortErr, err)
-			}
-			return "", fmt.Errorf("failed to upload part: %v", err)
-		}
-
-		// Create a copy of partNumber for the CompletedPart
-		pnum := partNumber
-		completedParts = append(completedParts, types.CompletedPart{
-			ETag:       partResp.ETag,
-			PartNumber: &pnum,
-		})
-		partNumber++
-	}
-
-	// Complete multipart upload
-	_, err = s.client.CompleteMultipartUpload(context.TODO(), &s3.CompleteMultipartUploadInput{
-		Bucket:   &s.bucket,
-		Key:      &filename,
-		UploadId: createResp.UploadId,
-		MultipartUpload: &types.CompletedMultipartUpload{
-			Parts: completedParts,
-		},
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to complete multipart upload: %v", err)
-	}
-
-	return filename, nil
+// GetInternalURL returns the internal URL for a file in SeaweedFS
+func (s *SeaweedFSStorage) GetInternalURL(path string) string {
+	return fmt.Sprintf("%s/%s", s.internalURL, path)
 }
 
-// GetURL implements Storage interface for S3Storage
-func (s *S3Storage) GetURL(filename string) string {
-	cleanName := filepath.Base(filename)
-	return fmt.Sprintf("%s/media/files/%s", s.publicURL, cleanName)
-}
+// UploadBytes uploads bytes to SeaweedFS
+func (s *SeaweedFSStorage) UploadBytes(data []byte, filename string) (string, error) {
+	path := filepath.Clean(filename)
+	collection := "default"
+	ttl := ""
 
-// GetInternalURL implements Storage interface for S3Storage
-func (s *S3Storage) GetInternalURL(filename string) string {
-	return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", s.bucket, s.region, filename)
-}
-
-// Delete implements Storage interface for S3Storage
-func (s *S3Storage) Delete(filename string) error {
-	_, err := s.client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
-		Bucket: &s.bucket,
-		Key:    &filename,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to delete from S3: %v", err)
+	if _, err := s.client.Upload(bytes.NewReader(data), -1, path, collection, ttl); err != nil {
+		return "", fmt.Errorf("failed to upload bytes to SeaweedFS: %v", err)
 	}
-	return nil
+	return path, nil
 }
 
-// Update GetPresignedURL for SeaweedFSStorage
+// GetPresignedURL generates a presigned URL for SeaweedFS
 func (s *SeaweedFSStorage) GetPresignedURL(fileID string, expiration time.Duration) (string, error) {
-    // Generate a token with expiration time
-    expirationTime := time.Now().Add(expiration).Unix()
-    token := fmt.Sprintf("exp=%d", expirationTime)
-    
-    // Construct URL with token
-    return fmt.Sprintf("%s/%s?%s", s.publicURL, fileID, token), nil
+	expirationTime := time.Now().Add(expiration).Unix()
+	token := fmt.Sprintf("exp=%d", expirationTime)
+	return fmt.Sprintf("%s/%s?%s", s.publicURL, fileID, token), nil
 }
 
-// Update GetPresignedURL for S3Storage
-func (s *S3Storage) GetPresignedURL(fileID string, expiration time.Duration) (string, error) {
-    presignClient := s3.NewPresignClient(s.client)
-    
-    request, err := presignClient.PresignGetObject(context.TODO(), &s3.GetObjectInput{
-        Bucket:          &s.bucket,
-        Key:            &fileID,
-        ResponseExpires: aws.Time(time.Now().Add(expiration)),
-    }, func(opts *s3.PresignOptions) {
-        opts.Expires = expiration
-    })
-    
-    if err != nil {
-        return "", fmt.Errorf("failed to generate presigned URL: %v", err)
-    }
-    
-    return request.URL, nil
+var (
+	provider Storage
+	once     sync.Once
+)
+
+// GetProvider returns the configured storage provider
+func GetProvider() Storage {
+	once.Do(func() {
+		var err error
+		cfg := config.GetConfig()
+		var storageConfig map[string]string
+
+		switch cfg.Storage.Provider {
+		case "s3":
+			storageConfig = map[string]string{
+				"region":            cfg.Storage.S3.Region,
+				"access_key_id":     cfg.Storage.S3.AccessKeyID,
+				"secret_access_key": cfg.Storage.S3.SecretAccessKey,
+				"bucket":            cfg.Storage.S3.BucketName,
+				"endpoint":          cfg.Storage.S3.Endpoint,
+				"force_path_style":  "true",
+				"public_url":        cfg.Storage.S3.PublicURL,
+			}
+			provider, err = NewS3Storage(storageConfig)
+		case "seaweedfs":
+			storageConfig = map[string]string{
+				"master_url":   cfg.Storage.SeaweedFS.MasterURL,
+				"internal_url": fmt.Sprintf("http://localhost:%d", cfg.Storage.SeaweedFS.VolumePort),
+				"public_url":   fmt.Sprintf("http://localhost:%s", cfg.Server.Port),
+			}
+			provider, err = NewSeaweedFSStorage(storageConfig)
+		default:
+			panic(fmt.Sprintf("Unsupported storage provider: %s", cfg.Storage.Provider))
+		}
+		if err != nil {
+			panic(fmt.Sprintf("Failed to initialize storage provider: %v", err))
+		}
+	})
+	return provider
+}
+
+// NewStorage creates a new storage provider instance
+func NewStorage(provider StorageProvider, config map[string]string) (Storage, error) {
+	switch provider {
+	case S3:
+		return NewS3Storage(config)
+	case SeaweedFS:
+		return NewSeaweedFSStorage(config)
+	default:
+		return nil, fmt.Errorf("unsupported storage provider: %s", provider)
+	}
+}
+
+// NewS3Storage creates a new S3 storage instance
+func NewS3Storage(config map[string]string) (Storage, error) {
+	cfg := aws.Config{
+		Region: config["region"],
+		Credentials: credentials.NewStaticCredentialsProvider(
+			config["access_key_id"],
+			config["secret_access_key"],
+			"",
+		),
+	}
+
+	if endpoint := config["endpoint"]; endpoint != "" {
+		customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:               endpoint,
+				SigningRegion:     config["region"],
+				HostnameImmutable: true,
+			}, nil
+		})
+		cfg.EndpointResolverWithOptions = customResolver
+	}
+
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.UsePathStyle = config["force_path_style"] == "true"
+	})
+
+	return &S3Storage{
+		client:    client,
+		bucket:    config["bucket"],
+		publicURL: config["public_url"],
+	}, nil
+}
+
+// NewSeaweedFSStorage creates a new SeaweedFS storage instance
+func NewSeaweedFSStorage(config map[string]string) (Storage, error) {
+	client, err := goseaweedfs.NewFiler(config["master_url"], nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SeaweedFS client: %v", err)
+	}
+
+	return &SeaweedFSStorage{
+		client:      client,
+		internalURL: config["internal_url"],
+		publicURL:   config["public_url"],
+	}, nil
 }

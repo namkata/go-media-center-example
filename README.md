@@ -162,6 +162,139 @@ make clean
 - Image processing capabilities (resize, crop)
 - Multipart upload support for large files
 
+## Media Transformation & Processing
+
+### Image Transformations
+
+The media center supports real-time image transformations through URL parameters when accessing media files. You can combine multiple transformations in a single request.
+
+#### Resizing
+```
+GET /api/v1/media/files/{filename}?w=800&h=600&fit=contain
+```
+
+Parameters:
+- `w` - Target width in pixels
+- `h` - Target height in pixels
+- `fit` - Resize strategy (options: contain, cover, fill)
+  - `contain` - Maintain aspect ratio, fit within dimensions
+  - `cover` - Maintain aspect ratio, cover entire dimensions
+  - `fill` - Stretch to exact dimensions
+
+Examples:
+```
+# Resize to 800px width, maintain aspect ratio
+/api/v1/media/files/image.jpg?w=800
+
+# Resize to 600px height, maintain aspect ratio
+/api/v1/media/files/image.jpg?h=600
+
+# Resize to exact dimensions
+/api/v1/media/files/image.jpg?w=800&h=600&fit=fill
+
+# Create thumbnail
+/api/v1/media/files/image.jpg?w=150&h=150&fit=cover
+```
+
+#### Cropping
+```
+GET /api/v1/media/files/{filename}?crop=x,y,width,height
+```
+
+Parameters:
+- `x` - Starting X coordinate
+- `y` - Starting Y coordinate
+- `width` - Crop width
+- `height` - Crop height
+
+Example:
+```
+# Crop a region starting at (100,100) with size 500x300
+/api/v1/media/files/image.jpg?crop=100,100,500,300
+```
+
+#### Quality and Format
+```
+GET /api/v1/media/files/{filename}?quality=80&format=webp
+```
+
+Parameters:
+- `quality` - JPEG/WebP quality (1-100)
+- `format` - Convert to format (jpg, png, webp)
+
+Example:
+```
+# Convert to WebP with 80% quality
+/api/v1/media/files/image.jpg?format=webp&quality=80
+```
+
+### Batch Processing
+
+For batch processing of images, use the batch endpoint:
+
+```
+POST /api/v1/media/batch
+Content-Type: application/json
+
+{
+  "operations": [
+    {
+      "media_id": "123",
+      "transformations": {
+        "resize": {
+          "width": 800,
+          "height": 600,
+          "fit": "contain"
+        },
+        "format": "webp",
+        "quality": 80
+      }
+    }
+  ]
+}
+```
+
+### Preset Transformations
+
+Common transformation presets are available:
+
+```
+# Thumbnail preset
+/api/v1/media/files/image.jpg?preset=thumbnail
+
+# Social media preset
+/api/v1/media/files/image.jpg?preset=social
+
+# High-quality preset
+/api/v1/media/files/image.jpg?preset=hq
+```
+
+Available presets:
+- `thumbnail` - 150x150 cover
+- `social` - 1200x630 contain
+- `hq` - 2048px max dimension, 90% quality
+- `avatar` - 300x300 cover
+- `banner` - 1920x400 cover
+
+### Caching
+
+Transformed images are cached by default. Cache headers are set appropriately for optimal performance. To force a fresh transformation, append `?fresh=true` to the URL.
+
+### Error Handling
+
+If a transformation fails, the API will return:
+- HTTP 400 for invalid parameters
+- HTTP 404 for non-existent images
+- HTTP 422 for unsupported operations
+
+Error response format:
+```json
+{
+  "error": "Invalid transformation parameters",
+  "details": "Width must be between 1 and 8192 pixels"
+}
+```
+
 ## Contributing
 
 1. Fork the repository

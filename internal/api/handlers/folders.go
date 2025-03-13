@@ -10,10 +10,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// CreateFolder handles folder creation
 func CreateFolder(c *gin.Context) {
 	var input struct {
-		Name     string `json:"name" binding:"required,min=1,max=255"`
-		ParentID *uint  `json:"parent_id,omitempty"`
+		Name        string `json:"name" binding:"required,min=1,max=255"`
+		Description string `json:"description"`
+		ParentID    *uint  `json:"parent_id,omitempty"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -38,9 +40,10 @@ func CreateFolder(c *gin.Context) {
 
 	userID, _ := c.Get("user_id")
 	folder := models.Folder{
-		Name:     input.Name,
-		ParentID: input.ParentID,
-		UserID:   userID.(uint),
+		Name:        input.Name,
+		Description: input.Description,
+		ParentID:    input.ParentID,
+		UserID:      userID.(uint),
 	}
 
 	if err := database.GetDB().Create(&folder).Error; err != nil {
@@ -51,6 +54,7 @@ func CreateFolder(c *gin.Context) {
 	c.JSON(http.StatusCreated, folder)
 }
 
+// ListFolders handles listing all folders for a user
 func ListFolders(c *gin.Context) {
 	var folders []models.Folder
 	userID, _ := c.Get("user_id")
@@ -115,11 +119,31 @@ func ListFolders(c *gin.Context) {
 	})
 }
 
+// GetFolder handles retrieving a single folder
+func GetFolder(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	var folder models.Folder
+
+	if err := database.GetDB().Where("id = ? AND user_id = ?", c.Param("id"), userID).First(&folder).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Folder not found"})
+		return
+	}
+
+	// Get media count
+	var mediaCount int64
+	if err := database.GetDB().Model(&models.Media{}).Where("folder_id = ?", folder.ID).Count(&mediaCount).Error; err == nil {
+		folder.MediaCount = mediaCount
+	}
+
+	c.JSON(http.StatusOK, folder)
+}
+
+// UpdateFolder handles updating a folder
 func UpdateFolder(c *gin.Context) {
-	id := c.Param("id")
 	var input struct {
-		Name     string `json:"name"`
-		ParentID *uint  `json:"parent_id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		ParentID    *uint  `json:"parent_id"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -130,15 +154,31 @@ func UpdateFolder(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 	var folder models.Folder
 
-	if err := database.GetDB().Where("id = ? AND user_id = ?", id, userID).First(&folder).Error; err != nil {
+	if err := database.GetDB().Where("id = ? AND user_id = ?", c.Param("id"), userID).First(&folder).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Folder not found"})
 		return
 	}
 
-	folder.Name = input.Name
-	folder.ParentID = input.ParentID
+	updates := map[string]interface{}{}
+	if input.Name != "" {
+		updates["name"] = input.Name
+	}
+	if input.Description != "" {
+		updates["description"] = input.Description
+	}
+	if input.ParentID != nil {
+		// Validate parent folder if provided
+		if *input.ParentID > 0 {
+			var parentFolder models.Folder
+			if err := database.GetDB().Where("id = ?", *input.ParentID).First(&parentFolder).Error; err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Parent folder not found"})
+				return
+			}
+		}
+		updates["parent_id"] = input.ParentID
+	}
 
-	if err := database.GetDB().Save(&folder).Error; err != nil {
+	if err := database.GetDB().Model(&folder).Updates(updates).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update folder"})
 		return
 	}
@@ -146,9 +186,10 @@ func UpdateFolder(c *gin.Context) {
 	c.JSON(http.StatusOK, folder)
 }
 
+// DeleteFolder handles folder deletion
 func DeleteFolder(c *gin.Context) {
-	id := c.Param("id")
 	userID, _ := c.Get("user_id")
+	id := c.Param("id")
 
 	// Check if folder has media
 	var mediaCount int64

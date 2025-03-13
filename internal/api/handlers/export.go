@@ -27,7 +27,7 @@ func ExportCSV(c *gin.Context) {
 
 	writer := csv.NewWriter(c.Writer)
 	// Write header
-	if err := writer.Write([]string{"ID", "Name", "Type", "Size", "URL", "Created At", "Updated At"}); err != nil {
+	if err := writer.Write([]string{"ID", "Filename", "MimeType", "Size", "Path", "Created At", "Updated At"}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write CSV header"})
 		return
 	}
@@ -35,11 +35,11 @@ func ExportCSV(c *gin.Context) {
 	// Write data
 	for _, m := range media {
 		if err := writer.Write([]string{
-			fmt.Sprint(m.ID),
-			m.Name,
-			m.Type,
+			m.ID,
+			m.Filename,
+			m.MimeType,
 			fmt.Sprint(m.Size),
-			m.URL,
+			m.Path,
 			m.CreatedAt.String(),
 			m.UpdatedAt.String(),
 		}); err != nil {

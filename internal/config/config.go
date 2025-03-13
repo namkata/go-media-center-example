@@ -2,9 +2,17 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
+	"strings"
+	"sync"
 
 	"github.com/joho/godotenv"
+)
+
+var (
+	config *Config
+	once   sync.Once
 )
 
 type Config struct {
@@ -15,8 +23,9 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Port string
-	Env  string
+	Port           string
+	Env            string
+	TrustedProxies []string
 }
 
 type DatabaseConfig struct {
@@ -64,13 +73,14 @@ type S3Config struct {
 
 func Load() (*Config, error) {
 	if err := godotenv.Load(); err != nil {
-		return nil, fmt.Errorf("error loading .env file: %v", err)
+		log.Printf("Warning: .env file not found: %v", err)
 	}
 
 	config := &Config{
 		Server: ServerConfig{
-			Port: getEnv("PORT", "8080"),
-			Env:  getEnv("ENV", "development"),
+			Port:           getEnv("PORT", "8000"),
+			Env:            getEnv("ENV", "development"),
+			TrustedProxies: parseTrustedProxies(getEnv("TRUSTED_PROXIES", "")),
 		},
 		Database: DatabaseConfig{
 			Host:     getEnv("DB_HOST", "localhost"),
@@ -140,4 +150,33 @@ func getEnvAsBool(key string, defaultValue bool) bool {
 		return value == "true" || value == "1" || value == "yes"
 	}
 	return defaultValue
+}
+
+func GetConfig() *Config {
+	once.Do(func() {
+		var err error
+		config, err = Load()
+		if err != nil {
+			panic(fmt.Sprintf("Failed to load configuration: %v", err))
+		}
+	})
+	return config
+}
+
+// IsProduction returns true if the environment is production
+func (s *ServerConfig) IsProduction() bool {
+	return s.Env == "production"
+}
+
+// IsDevelopment returns true if the environment is development
+func (s *ServerConfig) IsDevelopment() bool {
+	return s.Env == "development"
+}
+
+// parseTrustedProxies splits a comma-separated list of proxy addresses
+func parseTrustedProxies(proxies string) []string {
+	if proxies == "" {
+		return nil
+	}
+	return strings.Split(proxies, ",")
 }

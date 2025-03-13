@@ -1,7 +1,10 @@
 package handlers
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,11 +17,12 @@ import (
 	"go-media-center-example/internal/utils"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // initializeStorage creates a new storage provider based on configuration
 const (
-    defaultURLExpiration = 24 * time.Hour // Default URL expiration time
+	defaultURLExpiration = 24 * time.Hour // Default URL expiration time
 )
 
 func initializeStorage() (storage.Storage, error) {
@@ -54,14 +58,7 @@ func initializeStorage() (storage.Storage, error) {
 			"bucket":            cfg.Storage.S3.BucketName,
 			"endpoint":          cfg.Storage.S3.Endpoint,
 			"force_path_style":  "true",
-			"url_expiration":    defaultURLExpiration.String(),
-		}
-
-		// Set public URL if provided, otherwise construct it
-		if cfg.Storage.S3.PublicURL != "" {
-			storageConfig["public_url"] = cfg.Storage.S3.PublicURL
-		} else if cfg.Storage.S3.Endpoint != "" {
-			storageConfig["public_url"] = fmt.Sprintf("%s/%s", cfg.Storage.S3.Endpoint, cfg.Storage.S3.BucketName)
+			"public_url":        cfg.Storage.S3.PublicURL,
 		}
 	}
 
@@ -73,14 +70,26 @@ func ServeMediaFile(c *gin.Context) {
 	filename := c.Param("filename")
 	userID, _ := c.Get("user_id")
 
-	// Parse width and height parameters
-	width := c.Query("w")
-	height := c.Query("h")
-	fit := c.DefaultQuery("fit", "contain") // contain, cover, fill
+	// Parse transformation options
+	queryParams := make(map[string]string)
+	for k := range c.Request.URL.Query() {
+		queryParams[k] = c.Query(k)
+	}
+
+	transformOptions := utils.TransformationOptions{
+		Width:   utils.ParseIntOption(queryParams["width"]),
+		Height:  utils.ParseIntOption(queryParams["height"]),
+		Fit:     queryParams["fit"],
+		Crop:    queryParams["crop"],
+		Quality: utils.ParseIntOption(queryParams["quality"]),
+		Format:  queryParams["format"],
+		Preset:  queryParams["preset"],
+		Fresh:   queryParams["fresh"] == "true",
+	}
 
 	// Find media by filename
 	var media models.Media
-	if err := database.GetDB().Where("url LIKE ?", "%"+filename+"%").
+	if err := database.GetDB().Where("path LIKE ?", "%"+filename+"%").
 		Where("user_id = ?", userID).
 		First(&media).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Media not found"})
@@ -95,7 +104,7 @@ func ServeMediaFile(c *gin.Context) {
 	}
 
 	// Get internal URL for the file using the stored file ID
-	internalURL := storageProvider.GetInternalURL(media.URL)
+	internalURL := storageProvider.GetInternalURL(media.Path)
 
 	// Create HTTP client with appropriate timeout
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -109,51 +118,47 @@ func ServeMediaFile(c *gin.Context) {
 	defer resp.Body.Close()
 
 	// Get content type
-	contentType := ""
-	if ct, ok := media.Metadata["mime_type"].(string); ok {
-		contentType = ct
-	} else {
-		contentType = resp.Header.Get("Content-Type")
-	}
+	contentType := media.MimeType
 
-	// Check if it's an image that needs resizing
-	if (width != "" || height != "") && strings.HasPrefix(contentType, "image/") {
-		// Parse dimensions
-		var w, h int
-		if width != "" {
-			w, _ = strconv.Atoi(width)
-		}
-		if height != "" {
-			h, _ = strconv.Atoi(height)
-		}
-
-		// Process image if valid dimensions
-		if w > 0 || h > 0 {
-			resizedImage, err := utils.ProcessImageWithSize(resp.Body, w, h, fit)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to process image: %v", err)})
-				return
-			}
-
-			// Set headers
-			c.Header("Content-Type", contentType)
-			if originalName, ok := media.Metadata["original_name"].(string); ok {
-				c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", originalName))
-			}
-
-			// Write the processed image
-			c.Writer.Write(resizedImage)
+	// Check if it's an image that needs transformation
+	if strings.HasPrefix(contentType, "image/") && !transformOptions.IsEmpty() {
+		// Apply transformations
+		transformedImage, err := utils.TransformImage(resp.Body, transformOptions)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to transform image: %v", err)})
 			return
 		}
+
+		// Set appropriate content type based on format
+		switch transformOptions.Format {
+		case "png":
+			contentType = "image/png"
+		case "webp":
+			contentType = "image/webp"
+		default:
+			contentType = "image/jpeg"
+		}
+
+		// Set cache control headers
+		if !transformOptions.Fresh {
+			c.Header("Cache-Control", "public, max-age=31536000") // Cache for 1 year
+			c.Header("ETag", fmt.Sprintf("%s-%v", filename, transformOptions))
+		} else {
+			c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+		}
+
+		// Set content type and filename
+		c.Header("Content-Type", contentType)
+		c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", media.Filename))
+
+		// Write the transformed image
+		c.Data(http.StatusOK, contentType, transformedImage)
+		return
 	}
 
-	// Set content type
+	// For non-image files or no transformation needed
 	c.Header("Content-Type", contentType)
-
-	// Set filename for download
-	if originalName, ok := media.Metadata["original_name"].(string); ok {
-		c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", originalName))
-	}
+	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", media.Filename))
 
 	// Stream the original file
 	c.DataFromReader(http.StatusOK, resp.ContentLength, contentType, resp.Body, nil)
@@ -188,8 +193,16 @@ func UploadMedia(c *gin.Context) {
 		return
 	}
 
+	// Open the file for reading
+	f, err := file.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to open file: %v", err)})
+		return
+	}
+	defer f.Close()
+
 	// Upload file to storage
-	fileID, err := storageProvider.Upload(file)
+	fileID, err := storageProvider.Upload(f, file.Filename)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to upload file: %v", err)})
 		return
@@ -197,21 +210,18 @@ func UploadMedia(c *gin.Context) {
 
 	// Get both internal and public URLs for the file
 	fileInternalURL := storageProvider.GetInternalURL(fileID)
-	filePublicURL := storageProvider.GetURL(fileID)
+	filePublicURL := storageProvider.GetPublicURL(fileID)
 
 	// Get folder ID if provided
 	folderID := c.PostForm("folder_id")
-	var fID *uint
+	var fID *string
 	if folderID != "" {
-		if id, err := strconv.ParseUint(folderID, 10, 32); err == nil {
-			converted := uint(id)
-			// Verify folder exists and belongs to user
-			var folder models.Folder
-			if err := database.GetDB().Where("id = ? AND user_id = ?", converted, userID).First(&folder).Error; err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid folder ID"})
-				return
-			}
-			fID = &converted
+		fID = &folderID
+		// Verify folder exists and belongs to user
+		var folder models.Folder
+		if err := database.GetDB().Where("id = ? AND user_id = ?", folderID, userID).First(&folder).Error; err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid folder ID"})
+			return
 		}
 	}
 
@@ -231,7 +241,7 @@ func UploadMedia(c *gin.Context) {
 	}
 
 	// Create metadata combining file info and technical metadata
-	metadata := models.JSON{
+	metadata := map[string]interface{}{
 		"original_name": file.Filename,
 		"file_id":       fileID,
 		"internal_url":  fileInternalURL,
@@ -239,21 +249,28 @@ func UploadMedia(c *gin.Context) {
 		"technical":     mediaMetadata,
 	}
 
+	// Convert metadata to JSON
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to marshal metadata: %v", err)})
+		return
+	}
+
 	// Save to database
 	media := models.Media{
-		Name:     file.Filename,
-		Type:     mediaMetadata.FileType,
-		Size:     file.Size,
-		URL:      fileID,
+		ID:       fileID,
 		UserID:   userID.(uint),
 		FolderID: fID,
-		Metadata: metadata,
-		Tags:     tags,
+		Filename: file.Filename,
+		Path:     fileID,
+		MimeType: mediaMetadata.MimeType,
+		Size:     file.Size,
+		Metadata: metadataJSON,
 	}
 
 	// Create with transaction
 	tx := database.GetDB().Begin()
-	if err := tx.Create(&media).Error; err != nil {
+	if err := tx.Model(&models.Media{}).Create(&media).Error; err != nil {
 		tx.Rollback()
 		// Clean up uploaded file
 		storageProvider.Delete(fileID)
@@ -274,7 +291,7 @@ func getFileURL(mediaItem *models.Media) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return storageProvider.GetURL(mediaItem.URL), nil
+	return storageProvider.GetPublicURL(mediaItem.Path), nil
 }
 
 func getFileInternalURL(mediaItem *models.Media) (string, error) {
@@ -282,7 +299,7 @@ func getFileInternalURL(mediaItem *models.Media) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return storageProvider.GetInternalURL(mediaItem.URL), nil
+	return storageProvider.GetInternalURL(mediaItem.Path), nil
 }
 
 func ListMedia(c *gin.Context) {
@@ -303,11 +320,11 @@ func ListMedia(c *gin.Context) {
 
 	// Apply filters
 	if fileType != "" {
-		query = query.Where("media.type = ?", fileType)
+		query = query.Where("media.mime_type LIKE ?", fileType+"%")
 	}
 
 	if search != "" {
-		query = query.Where("media.name ILIKE ?", "%"+search+"%")
+		query = query.Where("media.filename ILIKE ?", "%"+search+"%")
 	}
 
 	if folderID != "" {
@@ -319,9 +336,7 @@ func ListMedia(c *gin.Context) {
 		query = query.Joins("LEFT JOIN media_tags ON media_tags.media_id = media.id").
 			Joins("LEFT JOIN tags ON tags.id = media_tags.tag_id").
 			Where("tags.name IN ?", tags).
-			Group("media.id, media.name, media.type, media.size, media.url, "+
-				"media.folder_id, media.user_id, media.metadata, "+
-				"media.created_at, media.updated_at, media.deleted_at").
+			Group("media.id").
 			Having("COUNT(DISTINCT tags.name) = ?", len(tags))
 	}
 
@@ -334,7 +349,7 @@ func ListMedia(c *gin.Context) {
 	}
 
 	// Apply pagination and fetch results
-	offset := 10
+	offset := (page - 1) * limit
 	if err := query.Offset(offset).Limit(limit).
 		Order("media.created_at DESC").
 		Scan(&media).Error; err != nil {
@@ -350,17 +365,27 @@ func ListMedia(c *gin.Context) {
 
 	// Add file URLs to the response
 	for i := range media {
-		if fileURL, err := getFileURL(&media[i]); err == nil {
-			if media[i].Metadata == nil {
-				media[i].Metadata = models.JSON{}
+		// Parse existing metadata
+		var metadata map[string]interface{}
+		if len(media[i].Metadata) > 0 {
+			if err := json.Unmarshal(media[i].Metadata, &metadata); err != nil {
+				metadata = make(map[string]interface{})
 			}
-			media[i].Metadata["public_url"] = fileURL
+		} else {
+			metadata = make(map[string]interface{})
+		}
+
+		// Add URLs to metadata
+		if fileURL, err := getFileURL(&media[i]); err == nil {
+			metadata["public_url"] = fileURL
 		}
 		if internalURL, err := getFileInternalURL(&media[i]); err == nil {
-			if media[i].Metadata == nil {
-				media[i].Metadata = models.JSON{}
-			}
-			media[i].Metadata["internal_url"] = internalURL
+			metadata["internal_url"] = internalURL
+		}
+
+		// Convert back to JSON
+		if metadataJSON, err := json.Marshal(metadata); err == nil {
+			media[i].Metadata = metadataJSON
 		}
 	}
 
@@ -376,62 +401,74 @@ func ListMedia(c *gin.Context) {
 }
 
 func GetMedia(c *gin.Context) {
-    id := c.Param("id")
-    userID, _ := c.Get("user_id")
+	id := c.Param("id")
+	userID, _ := c.Get("user_id")
 
-    // Get expiration from query parameter, default to 24 hours
-    expirationStr := c.DefaultQuery("expires", "86400") // 24 hours in seconds
-    expiration, err := strconv.Atoi(expirationStr)
-    if err != nil {
-        expiration = int(defaultURLExpiration.Seconds())
-    }
+	// Get expiration from query parameter, default to 24 hours
+	expirationStr := c.DefaultQuery("expires", "86400") // 24 hours in seconds
+	expiration, err := strconv.Atoi(expirationStr)
+	if err != nil {
+		expiration = int(defaultURLExpiration.Seconds())
+	}
 
-    var media models.Media
-    if err := database.GetDB().
-        Preload("Tags").
-        Where("id = ? AND user_id = ?", id, userID).
-        First(&media).Error; err != nil {
-        c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Media not found: %v", err)})
-        return
-    }
+	var media models.Media
+	if err := database.GetDB().
+		Preload("Tags").
+		Where("id = ? AND user_id = ?", id, userID).
+		First(&media).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Media not found: %v", err)})
+		return
+	}
 
-    // Initialize storage for presigned URL
-    storageProvider, err := initializeStorage()
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to initialize storage: %v", err)})
-        return
-    }
+	// Initialize storage for presigned URL
+	storageProvider, err := initializeStorage()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to initialize storage: %v", err)})
+		return
+	}
 
-    // Generate presigned URL
-    presignedURL, err := storageProvider.GetPresignedURL(media.URL, time.Duration(expiration)*time.Second)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to generate presigned URL: %v", err)})
-        return
-    }
+	// Generate presigned URL
+	presignedURL, err := storageProvider.GetPresignedURL(media.Path, time.Duration(expiration)*time.Second)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to generate presigned URL: %v", err)})
+		return
+	}
 
-    // Add URLs to metadata
-    if media.Metadata == nil {
-        media.Metadata = models.JSON{}
-    }
-    media.Metadata["presigned_url"] = presignedURL
-    media.Metadata["expires_in"] = expiration
+	// Add URLs to metadata
+	var metadata map[string]interface{}
+	if len(media.Metadata) > 0 {
+		if err := json.Unmarshal(media.Metadata, &metadata); err != nil {
+			metadata = make(map[string]interface{})
+		}
+	} else {
+		metadata = make(map[string]interface{})
+	}
 
-    // Get folder info if media is in a folder
-    if media.FolderID != nil {
-        var folder models.Folder
-        if err := database.GetDB().Select("id, name").First(&folder, media.FolderID).Error; err == nil {
-            c.JSON(http.StatusOK, gin.H{
-                "media": media,
-                "folder": gin.H{
-                    "id":   folder.ID,
-                    "name": folder.Name,
-                },
-            })
-            return
-        }
-    }
+	// Add presigned URL to metadata
+	metadata["presigned_url"] = presignedURL
+	metadata["url_expiration"] = expiration
 
-    c.JSON(http.StatusOK, gin.H{"media": media})
+	// Convert back to JSON
+	if metadataJSON, err := json.Marshal(metadata); err == nil {
+		media.Metadata = metadataJSON
+	}
+
+	// Get folder info if media is in a folder
+	if media.FolderID != nil {
+		var folder models.Folder
+		if err := database.GetDB().Select("id, name").First(&folder, media.FolderID).Error; err == nil {
+			c.JSON(http.StatusOK, gin.H{
+				"media": media,
+				"folder": gin.H{
+					"id":   folder.ID,
+					"name": folder.Name,
+				},
+			})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"media": media})
 }
 
 func UpdateMedia(c *gin.Context) {
@@ -439,10 +476,10 @@ func UpdateMedia(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 
 	var input struct {
-		Name     string      `json:"name"`
-		FolderID *uint       `json:"folder_id"`
-		Metadata models.JSON `json:"metadata"`
-		Tags     []string    `json:"tags"`
+		Filename string   `json:"filename"`
+		FolderID *string  `json:"folder_id"`
+		Metadata []byte   `json:"metadata"`
+		Tags     []string `json:"tags"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -457,7 +494,7 @@ func UpdateMedia(c *gin.Context) {
 	}
 
 	updates := map[string]interface{}{
-		"name":      input.Name,
+		"filename":  input.Filename,
 		"folder_id": input.FolderID,
 		"metadata":  input.Metadata,
 	}
@@ -488,7 +525,7 @@ func DeleteMedia(c *gin.Context) {
 	}
 
 	// Delete file from storage
-	if err := storageProvider.Delete(media.URL); err != nil {
+	if err := storageProvider.Delete(media.Path); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to delete file: %v", err)})
 		return
 	}
@@ -502,45 +539,157 @@ func DeleteMedia(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Media deleted successfully"})
 }
 
-func BatchOperation(c *gin.Context) {
-	var input struct {
-		Operation string   `json:"operation" binding:"required"`
-		MediaIDs  []string `json:"media_ids" binding:"required"`
-		FolderID  *uint    `json:"folder_id"`
-	}
-
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+// TransformMedia handles image transformation requests
+func TransformMedia(c *gin.Context) {
+	mediaID := c.Param("id")
+	if mediaID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Media ID is required"})
 		return
 	}
 
-	userID, _ := c.Get("user_id")
-	db := database.GetDB()
-
-	switch input.Operation {
-	case "delete":
-		if err := db.Where("id IN ? AND user_id = ?", input.MediaIDs, userID).Delete(&models.Media{}).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete media"})
-			return
-		}
-	case "move":
-		if input.FolderID == nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Folder ID required for move operation"})
-			return
-		}
-		if err := db.Model(&models.Media{}).Where("id IN ? AND user_id = ?", input.MediaIDs, userID).
-			Update("folder_id", input.FolderID).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to move media"})
-			return
-		}
-	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid operation"})
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"message":      "Batch operation completed",
-		"operation":    input.Operation,
-		"affected_ids": input.MediaIDs,
-	})
+	// Get media from database
+	media, err := models.GetMediaByID(mediaID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Media not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve media"})
+		return
+	}
+
+	// Check if media belongs to user
+	if media.UserID != userID.(uint) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+		return
+	}
+
+	// Check if media is an image
+	if !strings.HasPrefix(media.MimeType, "image/") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Media is not an image"})
+		return
+	}
+
+	// Parse transformation options from query parameters
+	options := utils.TransformationOptions{
+		Width:   utils.ParseIntOption(c.Query("width")),
+		Height:  utils.ParseIntOption(c.Query("height")),
+		Fit:     c.Query("fit"),
+		Crop:    c.Query("crop"),
+		Quality: utils.ParseIntOption(c.Query("quality")),
+		Format:  c.Query("format"),
+		Preset:  c.Query("preset"),
+		Fresh:   c.Query("fresh") == "true",
+	}
+
+	// Log transformation options for debugging
+	fmt.Printf("Transformation options: %+v\n", options)
+
+	// Validate transformation options
+	if err := options.Validate(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid transformation parameters",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// Apply preset if specified
+	if options.Preset != "" {
+		if err := utils.ApplyPreset(&options, options.Preset); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "Invalid preset",
+				"details": err.Error(),
+			})
+			return
+		}
+	}
+
+	// Get storage provider
+	storageProvider := storage.GetProvider()
+	if storageProvider == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Storage provider not initialized"})
+		return
+	}
+
+	// Read original file
+	reader, err := storageProvider.Download(media.Path)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to read original file",
+			"details": err.Error(),
+		})
+		return
+	}
+	defer reader.Close()
+
+	// Generate cache key for transformed image
+	cacheKey := fmt.Sprintf(
+		"%s_w%d_h%d_f%s_c%s_q%d_%s",
+		media.ID,
+		options.Width,
+		options.Height,
+		options.Fit,
+		options.Crop,
+		options.Quality,
+		options.Format,
+	)
+
+	// Check if transformed version exists
+	if !options.Fresh {
+		if cachedReader, err := storageProvider.Download(cacheKey); err == nil {
+			defer cachedReader.Close()
+			// Read the entire file into memory since we can't seek on the reader
+			data, err := io.ReadAll(cachedReader)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read cached file"})
+				return
+			}
+			c.Header("X-Cache", "HIT")
+			c.Data(http.StatusOK, media.MimeType, data)
+			return
+		}
+	}
+
+	// Transform image
+	transformed, err := utils.TransformImage(reader, options)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to transform image",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// Upload transformed version
+	if _, err := storageProvider.UploadBytes(transformed, cacheKey); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save transformed image"})
+		return
+	}
+
+	// Set cache control headers
+	c.Header("Cache-Control", "public, max-age=31536000")
+	c.Header("X-Cache", "MISS")
+
+	// Set appropriate content type based on format
+	contentType := media.MimeType
+	if options.Format != "" {
+		switch options.Format {
+		case "png":
+			contentType = "image/png"
+		case "webp":
+			contentType = "image/webp"
+		default:
+			contentType = "image/jpeg"
+		}
+	}
+
+	// Serve transformed image
+	c.Data(http.StatusOK, contentType, transformed)
 }
