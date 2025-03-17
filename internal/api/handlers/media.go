@@ -68,6 +68,26 @@ func initializeStorage() (storage.Storage, error) {
 }
 
 // ServeMediaFile handles serving media files through the application server
+// ServeMediaFile godoc
+// @Summary      Serve media file
+// @Description  Serve media file with optional transformations
+// @Tags         media
+// @Accept       json
+// @Produce      */*
+// @Param        filename  path      string  true   "Filename"
+// @Param        width     query     int     false  "Width in pixels"
+// @Param        height    query     int     false  "Height in pixels"
+// @Param        fit       query     string  false  "Fit method (contain, cover, fill)"
+// @Param        crop      query     string  false  "Crop position"
+// @Param        quality   query     int     false  "JPEG/WebP quality (1-100)"
+// @Param        format    query     string  false  "Output format (jpeg, png, webp)"
+// @Param        preset    query     string  false  "Transformation preset"
+// @Param        fresh     query     bool    false  "Bypass cache"
+// @Success      200       {file}    binary
+// @Failure      404       {object}  object{error=string}
+// @Failure      500       {object}  object{error=string}
+// @Router       /media/files/{filename} [get]
+// @Security     BearerAuth
 func ServeMediaFile(c *gin.Context) {
 	filename := c.Param("filename")
 	userID, _ := c.Get("user_id")
@@ -166,6 +186,20 @@ func ServeMediaFile(c *gin.Context) {
 	c.DataFromReader(http.StatusOK, resp.ContentLength, contentType, resp.Body, nil)
 }
 
+// UploadMedia godoc
+// @Summary      Upload media file
+// @Description  Upload a new media file with optional folder and tags
+// @Tags         media
+// @Accept       multipart/form-data
+// @Produce      json
+// @Param        file       formData  file      true   "Media file"
+// @Param        folder_id  formData  string    false  "Folder ID"
+// @Param        tags       formData  []string  false  "Tags"
+// @Success      200        {object}  object{message=string,media=models.Media}
+// @Failure      400        {object}  object{error=string}
+// @Failure      500        {object}  object{error=string}
+// @Router       /media/upload [post]
+// @Security     BearerAuth
 func UploadMedia(c *gin.Context) {
 	cfg, _ := config.Load()
 	userID, _ := c.Get("user_id")
@@ -288,6 +322,18 @@ func UploadMedia(c *gin.Context) {
 }
 
 // UploadMediaFromURL handles uploading media from a URL
+// UploadMediaFromURL godoc
+// @Summary      Upload media from URL
+// @Description  Download and upload a file from a remote URL
+// @Tags         media
+// @Accept       json
+// @Produce      json
+// @Param        input  body      object{url=string,filename=string,folder_id=string,tags=[]string}  true  "URL upload data"
+// @Success      200    {object}  object{message=string,media=models.Media}
+// @Failure      400    {object}  object{error=string}
+// @Failure      500    {object}  object{error=string}
+// @Router       /media/upload-url [post]
+// @Security     BearerAuth
 func UploadMediaFromURL(c *gin.Context) {
 	cfg, _ := config.Load()
 	userID, _ := c.Get("user_id")
@@ -531,6 +577,20 @@ func UploadMediaFromURL(c *gin.Context) {
 }
 
 // BulkUploadMedia handles uploading multiple files at once
+// BulkUploadMedia godoc
+// @Summary      Upload multiple media files
+// @Description  Upload multiple files at once with shared folder and tags
+// @Tags         media
+// @Accept       multipart/form-data
+// @Produce      json
+// @Param        files      formData  file      true   "Media files"
+// @Param        folder_id  formData  string    false  "Folder ID"
+// @Param        tags       formData  []string  false  "Tags"
+// @Success      200        {object}  object{message=string,total=int,success_count=int,results=[]object}
+// @Failure      400        {object}  object{error=string}
+// @Failure      500        {object}  object{error=string}
+// @Router       /media/bulk-upload [post]
+// @Security     BearerAuth
 func BulkUploadMedia(c *gin.Context) {
 	cfg, _ := config.Load()
 	userID, _ := c.Get("user_id")
@@ -732,6 +792,22 @@ func getFileInternalURL(mediaItem *models.Media) (string, error) {
 	return storageProvider.GetInternalURL(mediaItem.Path), nil
 }
 
+// ListMedia godoc
+// @Summary      List media files
+// @Description  Get paginated list of media files with optional filters
+// @Tags         media
+// @Accept       json
+// @Produce      json
+// @Param        page       query     int        false  "Page number (default 1)"
+// @Param        limit      query     int        false  "Items per page (default 10)"
+// @Param        type       query     string     false  "File type filter"
+// @Param        search     query     string     false  "Search term"
+// @Param        folder_id  query     string     false  "Folder ID"
+// @Param        tags       query     []string   false  "Tags filter"
+// @Success      200        {object}  object{media=[]models.Media,pagination=object{current_page=int,total_pages=int,total_items=int,per_page=int}}
+// @Failure      500        {object}  object{error=string}
+// @Router       /media [get]
+// @Security     BearerAuth
 func ListMedia(c *gin.Context) {
 	var media []models.Media
 	userID, _ := c.Get("user_id")
@@ -830,6 +906,19 @@ func ListMedia(c *gin.Context) {
 	})
 }
 
+// GetMedia godoc
+// @Summary      Get media details with presigned URL
+// @Description  Get media by ID with optional URL expiration time
+// @Tags         media
+// @Accept       json
+// @Produce      json
+// @Param        id       path      string  true  "Media ID"
+// @Param        expires  query     int     false "URL expiration time in seconds (default 86400)"
+// @Success      200      {object}  object{media=models.SwaggerMedia,folder=object{id=string,name=string}}
+// @Failure      404      {object}  object{error=string}
+// @Failure      500      {object}  object{error=string}
+// @Router       /media/{id} [get]
+// @Security     BearerAuth
 func GetMedia(c *gin.Context) {
 	id := c.Param("id")
 	userID, _ := c.Get("user_id")
@@ -901,6 +990,20 @@ func GetMedia(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"media": media})
 }
 
+// UpdateMedia godoc
+// @Summary      Update media details
+// @Description  Update filename, folder, metadata or tags for a media item
+// @Tags         media
+// @Accept       json
+// @Produce      json
+// @Param        id      path      string                  true  "Media ID"
+// @Param        input   body      object{filename=string,folder_id=string,metadata=object,tags=[]string}  true  "Media update data"
+// @Success      200     {object}  models.Media
+// @Failure      400     {object}  object{error=string}
+// @Failure      404     {object}  object{error=string}
+// @Failure      500     {object}  object{error=string}
+// @Router       /media/{id} [put]
+// @Security     BearerAuth
 func UpdateMedia(c *gin.Context) {
 	id := c.Param("id")
 	userID, _ := c.Get("user_id")
@@ -937,6 +1040,18 @@ func UpdateMedia(c *gin.Context) {
 	c.JSON(http.StatusOK, media)
 }
 
+// DeleteMedia godoc
+// @Summary      Delete media
+// @Description  Delete media file and its metadata
+// @Tags         media
+// @Accept       json
+// @Produce      json
+// @Param        id   path      string  true  "Media ID"
+// @Success      200  {object}  object{message=string}
+// @Failure      404  {object}  object{error=string}
+// @Failure      500  {object}  object{error=string}
+// @Router       /media/{id} [delete]
+// @Security     BearerAuth
 func DeleteMedia(c *gin.Context) {
 	id := c.Param("id")
 	userID, _ := c.Get("user_id")
@@ -970,6 +1085,27 @@ func DeleteMedia(c *gin.Context) {
 }
 
 // TransformMedia handles image transformation requests
+// TransformMedia godoc
+// @Summary      Transform image
+// @Description  Apply transformations to an image (resize, crop, format conversion)
+// @Tags         media
+// @Accept       json
+// @Produce      image/jpeg,image/png,image/webp
+// @Param        id       path      string  true   "Media ID"
+// @Param        width    query     int     false  "Width in pixels"
+// @Param        height   query     int     false  "Height in pixels"
+// @Param        fit      query     string  false  "Fit method (contain, cover, fill)"
+// @Param        crop     query     string  false  "Crop position (center, top, bottom, left, right)"
+// @Param        quality  query     int     false  "JPEG/WebP quality (1-100)"
+// @Param        format   query     string  false  "Output format (jpeg, png, webp)"
+// @Param        preset   query     string  false  "Transformation preset"
+// @Param        fresh    query     bool    false  "Bypass cache"
+// @Success      200      {file}    binary
+// @Failure      400      {object}  object{error=string,details=string}
+// @Failure      404      {object}  object{error=string}
+// @Failure      500      {object}  object{error=string,details=string}
+// @Router       /media/{id}/transform [get]
+// @Security     BearerAuth
 func TransformMedia(c *gin.Context) {
 	mediaID := c.Param("id")
 	if mediaID == "" {

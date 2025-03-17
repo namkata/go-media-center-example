@@ -31,6 +31,22 @@ type Media struct {
 // JSON is a custom type for handling JSON data in the database
 type JSON map[string]interface{}
 
+// MarshalJSON implements the json.Marshaler interface
+func (j JSON) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}(j))
+}
+
+// UnmarshalJSON implements the json.Unmarshaler interface
+func (j *JSON) UnmarshalJSON(data []byte) error {
+	var m map[string]interface{}
+	err := json.Unmarshal(data, &m)
+	if err != nil {
+		return err
+	}
+	*j = JSON(m)
+	return nil
+}
+
 // Scan implements the sql.Scanner interface
 func (j *JSON) Scan(value interface{}) error {
 	if value == nil {

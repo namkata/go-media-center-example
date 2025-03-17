@@ -1,0 +1,651 @@
+basePath: /api
+definitions:
+  go-media-center-example_internal_models.Media:
+    properties:
+      createdAt:
+        type: string
+      deletedAt:
+        $ref: '#/definitions/gorm.DeletedAt'
+      filename:
+        type: string
+      folderID:
+        type: string
+      id:
+        type: string
+      metadata:
+        items:
+          type: integer
+        type: array
+      mimeType:
+        type: string
+      path:
+        type: string
+      size:
+        type: integer
+      tags:
+        items:
+          $ref: '#/definitions/go-media-center-example_internal_models.Tag'
+        type: array
+      updatedAt:
+        type: string
+      userID:
+        type: integer
+    type: object
+  go-media-center-example_internal_models.SwaggerMedia:
+    description: Media file information
+    properties:
+      created_at:
+        example: "2023-01-01T12:00:00Z"
+        type: string
+      filename:
+        example: vacation.jpg
+        type: string
+      folder_id:
+        example: folder123
+        type: string
+      id:
+        example: 3f8d9a7c-5e4b-4b3a-8e1d-7f6b5c4d3a2b
+        type: string
+      metadata:
+        type: object
+      mime_type:
+        example: image/jpeg
+        type: string
+      path:
+        example: uploads/vacation.jpg
+        type: string
+      size:
+        example: 1024000
+        type: integer
+      tags:
+        items:
+          $ref: '#/definitions/go-media-center-example_internal_models.Tag'
+        type: array
+      updated_at:
+        example: "2023-01-01T12:00:00Z"
+        type: string
+      user_id:
+        example: 1
+        type: integer
+    type: object
+  go-media-center-example_internal_models.Tag:
+    properties:
+      createdAt:
+        type: string
+      deletedAt:
+        $ref: '#/definitions/gorm.DeletedAt'
+      id:
+        type: integer
+      media:
+        items:
+          $ref: '#/definitions/go-media-center-example_internal_models.Media'
+        type: array
+      name:
+        type: string
+      updatedAt:
+        type: string
+    type: object
+  gorm.DeletedAt:
+    properties:
+      time:
+        type: string
+      valid:
+        description: Valid is true if Time is not NULL
+        type: boolean
+    type: object
+host: localhost:8080
+info:
+  contact:
+    email: support@example.com
+    name: API Support
+    url: http://example.com/support
+  description: A media management system with support for images, videos, and documents
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  termsOfService: http://example.com/terms/
+  title: Media Center API
+  version: "1.0"
+paths:
+  /media:
+    get:
+      consumes:
+      - application/json
+      description: Get paginated list of media files with optional filters
+      parameters:
+      - description: Page number (default 1)
+        in: query
+        name: page
+        type: integer
+      - description: Items per page (default 10)
+        in: query
+        name: limit
+        type: integer
+      - description: File type filter
+        in: query
+        name: type
+        type: string
+      - description: Search term
+        in: query
+        name: search
+        type: string
+      - description: Folder ID
+        in: query
+        name: folder_id
+        type: string
+      - collectionFormat: csv
+        description: Tags filter
+        in: query
+        items:
+          type: string
+        name: tags
+        type: array
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            properties:
+              media:
+                items:
+                  $ref: '#/definitions/go-media-center-example_internal_models.Media'
+                type: array
+              pagination:
+                properties:
+                  current_page:
+                    type: integer
+                  per_page:
+                    type: integer
+                  total_items:
+                    type: integer
+                  total_pages:
+                    type: integer
+                type: object
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List media files
+      tags:
+      - media
+  /media/{id}:
+    delete:
+      consumes:
+      - application/json
+      description: Delete media file and its metadata
+      parameters:
+      - description: Media ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            properties:
+              message:
+                type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete media
+      tags:
+      - media
+    get:
+      consumes:
+      - application/json
+      description: Get media by ID with optional URL expiration time
+      parameters:
+      - description: Media ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: URL expiration time in seconds (default 86400)
+        in: query
+        name: expires
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            properties:
+              folder:
+                properties:
+                  id:
+                    type: string
+                  name:
+                    type: string
+                type: object
+              media:
+                $ref: '#/definitions/go-media-center-example_internal_models.SwaggerMedia'
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get media details with presigned URL
+      tags:
+      - media
+    put:
+      consumes:
+      - application/json
+      description: Update filename, folder, metadata or tags for a media item
+      parameters:
+      - description: Media ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Media update data
+        in: body
+        name: input
+        required: true
+        schema:
+          properties:
+            filename:
+              type: string
+            folder_id:
+              type: string
+            metadata:
+              type: object
+            tags:
+              items:
+                type: string
+              type: array
+          type: object
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/go-media-center-example_internal_models.Media'
+        "400":
+          description: Bad Request
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update media details
+      tags:
+      - media
+  /media/{id}/transform:
+    get:
+      consumes:
+      - application/json
+      description: Apply transformations to an image (resize, crop, format conversion)
+      parameters:
+      - description: Media ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Width in pixels
+        in: query
+        name: width
+        type: integer
+      - description: Height in pixels
+        in: query
+        name: height
+        type: integer
+      - description: Fit method (contain, cover, fill)
+        in: query
+        name: fit
+        type: string
+      - description: Crop position (center, top, bottom, left, right)
+        in: query
+        name: crop
+        type: string
+      - description: JPEG/WebP quality (1-100)
+        in: query
+        name: quality
+        type: integer
+      - description: Output format (jpeg, png, webp)
+        in: query
+        name: format
+        type: string
+      - description: Transformation preset
+        in: query
+        name: preset
+        type: string
+      - description: Bypass cache
+        in: query
+        name: fresh
+        type: boolean
+      produces:
+      - image/jpeg
+      - image/png
+      - image/webp
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: file
+        "400":
+          description: Bad Request
+          schema:
+            properties:
+              details:
+                type: string
+              error:
+                type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            properties:
+              details:
+                type: string
+              error:
+                type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Transform image
+      tags:
+      - media
+  /media/bulk-upload:
+    post:
+      consumes:
+      - multipart/form-data
+      description: Upload multiple files at once with shared folder and tags
+      parameters:
+      - description: Media files
+        in: formData
+        name: files
+        required: true
+        type: file
+      - description: Folder ID
+        in: formData
+        name: folder_id
+        type: string
+      - collectionFormat: csv
+        description: Tags
+        in: formData
+        items:
+          type: string
+        name: tags
+        type: array
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            properties:
+              message:
+                type: string
+              results:
+                items:
+                  type: object
+                type: array
+              success_count:
+                type: integer
+              total:
+                type: integer
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Upload multiple media files
+      tags:
+      - media
+  /media/files/{filename}:
+    get:
+      consumes:
+      - application/json
+      description: Serve media file with optional transformations
+      parameters:
+      - description: Filename
+        in: path
+        name: filename
+        required: true
+        type: string
+      - description: Width in pixels
+        in: query
+        name: width
+        type: integer
+      - description: Height in pixels
+        in: query
+        name: height
+        type: integer
+      - description: Fit method (contain, cover, fill)
+        in: query
+        name: fit
+        type: string
+      - description: Crop position
+        in: query
+        name: crop
+        type: string
+      - description: JPEG/WebP quality (1-100)
+        in: query
+        name: quality
+        type: integer
+      - description: Output format (jpeg, png, webp)
+        in: query
+        name: format
+        type: string
+      - description: Transformation preset
+        in: query
+        name: preset
+        type: string
+      - description: Bypass cache
+        in: query
+        name: fresh
+        type: boolean
+      produces:
+      - '*/*'
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: file
+        "404":
+          description: Not Found
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Serve media file
+      tags:
+      - media
+  /media/upload:
+    post:
+      consumes:
+      - multipart/form-data
+      description: Upload a new media file with optional folder and tags
+      parameters:
+      - description: Media file
+        in: formData
+        name: file
+        required: true
+        type: file
+      - description: Folder ID
+        in: formData
+        name: folder_id
+        type: string
+      - collectionFormat: csv
+        description: Tags
+        in: formData
+        items:
+          type: string
+        name: tags
+        type: array
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            properties:
+              media:
+                $ref: '#/definitions/go-media-center-example_internal_models.Media'
+              message:
+                type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Upload media file
+      tags:
+      - media
+  /media/upload-url:
+    post:
+      consumes:
+      - application/json
+      description: Download and upload a file from a remote URL
+      parameters:
+      - description: URL upload data
+        in: body
+        name: input
+        required: true
+        schema:
+          properties:
+            filename:
+              type: string
+            folder_id:
+              type: string
+            tags:
+              items:
+                type: string
+              type: array
+            url:
+              type: string
+          type: object
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            properties:
+              media:
+                $ref: '#/definitions/go-media-center-example_internal_models.Media'
+              message:
+                type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            properties:
+              error:
+                type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Upload media from URL
+      tags:
+      - media
+securityDefinitions:
+  BearerAuth:
+    description: Type "Bearer" followed by a space and JWT token
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

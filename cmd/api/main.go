@@ -5,10 +5,34 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	_ "go-media-center-example/docs" // Import swagger docs
 	"go-media-center-example/internal/api"
 	"go-media-center-example/internal/config"
 	"go-media-center-example/internal/database"
+
+	swaggerFiles "github.com/swaggo/files"
+	ginSwagger "github.com/swaggo/gin-swagger"
 )
+
+// @title           Media Center API
+// @version         1.0
+// @description     A media management system with support for images, videos, and documents
+// @termsOfService  http://example.com/terms/
+
+// @contact.name   API Support
+// @contact.url    http://example.com/support
+// @contact.email  support@example.com
+
+// @license.name  MIT
+// @license.url   https://opensource.org/licenses/MIT
+
+// @host      localhost:8080
+// @BasePath  /api
+
+// @securityDefinitions.apikey BearerAuth
+// @in header
+// @name Authorization
+// @description Type "Bearer" followed by a space and JWT token
 
 func main() {
 	// Load configuration
@@ -45,6 +69,9 @@ func main() {
 
 	// Initialize Routes
 	api.SetupRoutes(router)
+
+	// Add Swagger route - make sure this is before router.Run
+	router.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 
 	// Start Server
 	if err := router.Run(":" + cfg.Server.Port); err != nil {
